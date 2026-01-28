@@ -15,5 +15,12 @@ venv/
 .vscode/
 .idea/
 
+# Rust
+target/
+
+# Local caches
+.mem_cache/
+.mem_models/
+
 # Secrets
 .env

@@ -8,6 +8,7 @@ let
     sentence-transformers
     numpy
     typer
+    rich
   ]);
 in
 pkgs.mkShell {
@@ -15,12 +16,12 @@ pkgs.mkShell {
     my-python
   ];
 
-shellHook = ''
-    # ... existing code ...
-    
-    # Create an alias so 'mem' runs your python script
-    alias mem="python $PWD/cli.py"
-    
+  shellHook = ''
+    # Define `mem` as a shell function so it works
+    # both interactively and via `nix-shell --run`.
+    mem() { python "$PWD/cli.py" "$@"; }
+    export -f mem
+
     echo "Memory Agent ready. Type 'mem --help' to start."
   '';
 }

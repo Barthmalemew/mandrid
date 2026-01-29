@@ -7,7 +7,7 @@ edition = "2021"
 anyhow = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
 dirs = "5"
-fastembed = { version = "5.8.1", default-features = false, features = ["hf-hub", "hf-hub-rustls-tls", "ort-download-binaries"] }
+fastembed = { version = "5.8.1", default-features = false, features = ["hf-hub", "hf-hub-rustls-tls", "ort-load-dynamic"] }
 futures = "0.3"
 lancedb = "0.23.1"
 serde = { version = "1", features = ["derive"] }

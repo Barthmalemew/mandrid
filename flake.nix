@@ -23,23 +23,20 @@
         craneLib = crane.mkLib pkgs;
 
         # Common native dependencies
-        buildInputs = with pkgs; [
-          openssl
-          onnxruntime
-        ];
-
-        nativeBuildInputs = with pkgs; [
-          pkg-config
-          makeWrapper
-          protobuf
-        ];
-
-        # Def to build the crate
-        mandrid = craneLib.buildPackage {
+        commonArgs = {
           src = craneLib.cleanCargoSource (craneLib.path ./.);
           strictDeps = true;
 
-          inherit buildInputs nativeBuildInputs;
+          buildInputs = with pkgs; [
+            openssl
+            onnxruntime
+          ];
+
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+            makeWrapper
+            protobuf
+          ];
 
           # Fix for compiling lance/prost (protobuf)
           PROTOC = "${pkgs.protobuf}/bin/protoc";
@@ -49,6 +46,14 @@
           OPENSSL_DIR = "${pkgs.openssl.dev}";
           OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
           OPENSSL_INCLUDE_DIR = "${pkgs.openssl.dev}/include";
+        };
+
+        # Build *only* the cargo dependencies, to cache them
+        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+        # Build the actual crate
+        mandrid = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
 
           # Ensure we can find onnxruntime at runtime
           postInstall = ''
@@ -57,7 +62,7 @@
               --prefix LD_LIBRARY_PATH : "${pkgs.onnxruntime}/lib" \
               --set SSL_CERT_FILE "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
           '';
-        };
+        });
 
       in {
         packages.default = mandrid;

@@ -17,6 +17,7 @@ venv/
 
 # Rust
 target/
+bin/
 
 # Local caches
 .mem_cache/

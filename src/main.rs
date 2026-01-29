@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -15,6 +16,7 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 
 const DEFAULT_DB_PATH: &str = "./.mem_db";
 const DEFAULT_TABLE_NAME: &str = "memories";
+const STATE_FILE_NAME: &str = "index_state.json";
 const EMBEDDING_DIMS: i32 = 384;
 
 #[derive(Parser, Debug)]
@@ -38,6 +40,31 @@ enum Command {
         #[arg(long, default_value = "manual")]
         tag: String,
     },
+
+    /// Record an agent interaction (reasoning trace/decision).
+    Log {
+        /// What was done or decided
+        text: String,
+        /// Optional context tag (e.g. "auth-refactor")
+        #[arg(long, default_value = "interaction")]
+        tag: String,
+    },
+
+    /// Capture current context (git diff + reasoning) into memory.
+    Capture {
+        /// The reasoning or explanation for the current state/changes
+        reasoning: String,
+    },
+
+    /// Get a briefing of recent decisions and relevant project context.
+    Brief {
+        /// How many recent decisions to include
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
+
+    /// Initialize Mandrid in the current directory (setup DB, gitignore, docs).
+    Init,
 
     /// Ingest a single code file, chop it up, and save it.
     Digest {
@@ -73,6 +100,8 @@ struct AskJsonResult {
     rank: usize,
     tag: Option<String>,
     text: String,
+    memory_type: String,
+    created_at: u64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -86,6 +115,41 @@ struct MemoryRow {
     vector: Vec<f32>,
     text: String,
     tag: String,
+    memory_type: String,
+    created_at: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct FileMetadata {
+    mtime_secs: u64,
+    size_bytes: u64,
+    indexed_at: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
+struct IndexState {
+    files: HashMap<PathBuf, FileMetadata>,
+}
+
+impl IndexState {
+    fn load(db_path: &Path) -> Result<Self> {
+        let state_path = db_path.join(STATE_FILE_NAME);
+        if !state_path.exists() {
+            return Ok(Self::default());
+        }
+        let content = fs::read_to_string(&state_path)?;
+        Ok(serde_json::from_str(&content).unwrap_or_default())
+    }
+
+    fn save(&self, db_path: &Path) -> Result<()> {
+        let state_path = db_path.join(STATE_FILE_NAME);
+        if let Some(parent) = state_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string_pretty(self)?;
+        fs::write(state_path, content)?;
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -100,44 +164,212 @@ async fn main() -> Result<()> {
             let table = open_or_create_table(&db_path).await?;
 
             let embedding = embed_prefixed(&mut embedder, "passage", &text)?;
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs();
             let row = MemoryRow {
                 vector: embedding,
                 text,
                 tag,
+                memory_type: "manual".to_string(),
+                created_at: now,
             };
             add_rows(&table, vec![row]).await?;
             println!("Saved");
         }
-        Command::Digest { file_path } => {
+        Command::Log { text, tag } => {
             let mut embedder = init_embedder(cache_dir.clone(), true)?;
             let table = open_or_create_table(&db_path).await?;
 
-            let rows = digest_file(&mut embedder, &file_path).with_context(|| {
+            let embedding = embed_prefixed(&mut embedder, "passage", &text)?;
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs();
+            let row = MemoryRow {
+                vector: embedding,
+                text,
+                tag,
+                memory_type: "interaction".to_string(),
+                created_at: now,
+            };
+            add_rows(&table, vec![row]).await?;
+            println!("Logged interaction");
+        }
+        Command::Capture { reasoning } => {
+            let mut embedder = init_embedder(cache_dir.clone(), true)?;
+            let table = open_or_create_table(&db_path).await?;
+
+            let diff = std::process::Command::new("git")
+                .args(["diff", "HEAD"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_else(|_| "No git diff available".to_string());
+
+            let full_text = format!("Reasoning: {}\n\nChanges:\n{}", reasoning, diff);
+            let embedding = embed_prefixed(&mut embedder, "passage", &full_text)?;
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs();
+
+            let row = MemoryRow {
+                vector: embedding,
+                text: full_text,
+                tag: "capture".to_string(),
+                memory_type: "reasoning".to_string(),
+                created_at: now,
+            };
+            add_rows(&table, vec![row]).await?;
+            println!("Context captured");
+        }
+        Command::Brief { limit } => {
+            let table = open_table(&db_path).await.with_context(|| {
+                format!(
+                    "Database/Table not found at {} (run `mem learn .` first)",
+                    db_path.display()
+                )
+            })?;
+
+            // 1. Get recent reasoning/decisions (System 2)
+            let reasoning_stream = table
+                .query()
+                .only_if("memory_type = 'reasoning'")
+                .limit(limit)
+                .execute()
+                .await?;
+            let reasoning_batches: Vec<RecordBatch> = reasoning_stream.try_collect().await?;
+            let reasoning_rows = decode_rows(&reasoning_batches, None)?;
+
+            // 2. Get top manual/knowledge facts (System 1)
+            let knowledge_stream = table
+                .query()
+                .only_if("memory_type = 'manual' OR memory_type = 'interaction'")
+                .limit(limit)
+                .execute()
+                .await?;
+            let knowledge_batches: Vec<RecordBatch> = knowledge_stream.try_collect().await?;
+            let knowledge_rows = decode_rows(&knowledge_batches, None)?;
+
+            println!("=== PROJECT BRIEFING ===");
+            println!("\n[Recent Decisions & Reasoning]");
+            if reasoning_rows.is_empty() {
+                println!("No reasoning traces found.");
+            }
+            for (idx, (_tag, text, _type, _ts)) in reasoning_rows.into_iter().enumerate() {
+                println!("\n{}. {}", idx + 1, text);
+            }
+
+            println!("\n[Key Knowledge & Patterns]");
+            if knowledge_rows.is_empty() {
+                println!("No manual context found.");
+            }
+            for (idx, (tag, text, _type, _ts)) in knowledge_rows.into_iter().enumerate() {
+                println!("\n{}. [{}] {}", idx + 1, tag.unwrap_or_default(), text);
+            }
+        }
+        Command::Init => {
+            // 1. Create DB Directory
+            if !db_path.exists() {
+                fs::create_dir_all(&db_path).context("Failed to create .mem_db")?;
+                println!("Initialized empty memory at {}", db_path.display());
+            } else {
+                println!("Memory database already exists at {}", db_path.display());
+            }
+
+            // 2. Add to .gitignore
+            let gitignore_path = Path::new(".gitignore");
+            let mem_ignore = ".mem_db/";
+            let mut current_ignore = if gitignore_path.exists() {
+                fs::read_to_string(gitignore_path)?
+            } else {
+                String::new()
+            };
+
+            if !current_ignore.contains(mem_ignore) {
+                if !current_ignore.is_empty() && !current_ignore.ends_with('\n') {
+                    current_ignore.push('\n');
+                }
+                current_ignore.push_str(mem_ignore);
+                current_ignore.push('\n');
+                fs::write(gitignore_path, current_ignore)?;
+                println!("Added .mem_db/ to .gitignore");
+            }
+
+            // 3. Create AGENTS.md
+            let agents_md_path = Path::new("AGENTS.md");
+            if !agents_md_path.exists() {
+                let agents_content = r#"# Mandrid Memory Agent Instructions
+
+This project uses **Mandrid** (`mem`) to store context and reasoning.
+Before starting tasks, please verify the memory state.
+
+## Quick Start
+1. **Check Context:** Run `mem brief` to see recent decisions and reasoning.
+2. **Search:** Run `mem ask --json "query"` to find relevant code or patterns.
+3. **Capture:** When completing a significant task, run:
+   `mem capture "Reasoning: why I did this change"`
+
+## Tools
+- `mem learn`: Re-indexes the codebase (run this if you suspect the index is stale).
+- `mem capture`: Saves your git diff + reasoning to the permanent record.
+
+Do not edit `.mem_db/` manually.
+"#;
+                fs::write(agents_md_path, agents_content)?;
+                println!("Created AGENTS.md");
+            }
+        }
+        Command::Digest { ref file_path } => {
+            let mut embedder = init_embedder(cache_dir.clone(), true)?;
+            let table = open_or_create_table(&db_path).await?;
+
+            let rows = digest_file(&mut embedder, file_path).with_context(|| {
                 format!("Failed to digest file {}", file_path.display())
             })?;
             add_rows(&table, rows).await?;
             println!("Digested {}", file_path.display());
         }
-        Command::Learn { root_dir } => {
+        Command::Learn { ref root_dir } => {
             let mut embedder = init_embedder(cache_dir.clone(), true)?;
             let table = open_or_create_table(&db_path).await?;
+            let mut state = IndexState::load(&db_path)?;
 
-            let mut processed = 0usize;
-            for file in walk_repo_files(&root_dir)? {
-                let rows = match digest_file(&mut embedder, &file) {
-                    Ok(rows) => rows,
-                    Err(err) => {
-                        eprintln!("Skipping {}: {err}", file.display());
-                        continue;
-                    }
-                };
-                if !rows.is_empty() {
-                    add_rows(&table, rows).await?;
-                    processed += 1;
+            // 1. Garbage Collection (Pruning)
+            let mut pruned = 0usize;
+            let tracked_files: Vec<PathBuf> = state.files.keys().cloned().collect();
+            for path in tracked_files {
+                if !path.exists() {
+                    // File deleted from disk, remove from DB and State
+                    let tag = format!("code:{}", path.display());
+                    let predicate = format!("tag = '{}'", tag.replace('\'', "''"));
+                    let _ = table.delete(&predicate).await;
+                    
+                    state.files.remove(&path);
+                    pruned += 1;
+                    println!("Pruned missing file: {}", path.display());
                 }
             }
 
-            println!("Finished processing {processed} files");
+            // 2. Indexing / Updating
+            let mut processed = 0usize;
+            let mut skipped = 0usize;
+            let mut errors = 0usize;
+
+            for file in walk_repo_files(root_dir)? {
+                match process_file_if_changed(&mut embedder, &table, &mut state, &file).await {
+                    Ok(true) => processed += 1,
+                    Ok(false) => skipped += 1,
+                    Err(e) => {
+                        eprintln!("Error processing {}: {}", file.display(), e);
+                        errors += 1;
+                    }
+                }
+            }
+            state.save(&db_path)?;
+
+            println!(
+                "Finished: {} processed, {} skipped, {} pruned, {} errors",
+                processed, skipped, pruned, errors
+            );
         }
         Command::Ask {
             question,
@@ -186,7 +418,7 @@ async fn main() -> Result<()> {
             let rows = decode_rows(&batches, None)?;
 
             println!("\n___ RAW DATA INSPECTION ___");
-            for (idx, (tag, text)) in rows.into_iter().enumerate() {
+            for (idx, (tag, text, mem_type, created_at)) in rows.into_iter().enumerate() {
                 let status = if contains_brackets(&text) {
                     "Brackets Found"
                 } else {
@@ -195,6 +427,8 @@ async fn main() -> Result<()> {
 
                 println!("\n--- Entry {} ({}) ---", idx + 1, status);
                 println!("Tag: {}", tag.unwrap_or_default());
+                println!("Type: {}", mem_type);
+                println!("Timestamp: {}", created_at);
                 println!("Content:");
                 println!("{text}");
                 println!("{}", "-".repeat(30));
@@ -238,6 +472,8 @@ fn memory_schema() -> SchemaRef {
         ),
         Field::new("text", DataType::Utf8, false),
         Field::new("tag", DataType::Utf8, false),
+        Field::new("memory_type", DataType::Utf8, false),
+        Field::new("created_at", DataType::UInt64, false),
     ]))
 }
 
@@ -279,10 +515,18 @@ fn empty_record_batch(schema: SchemaRef) -> Result<RecordBatch> {
     );
     let texts = StringArray::from_iter_values(std::iter::empty::<&str>());
     let tags = StringArray::from_iter_values(std::iter::empty::<&str>());
+    let memory_types = StringArray::from_iter_values(std::iter::empty::<&str>());
+    let created_ats = arrow_array::UInt64Array::from_iter_values(std::iter::empty::<u64>());
 
     Ok(RecordBatch::try_new(
         schema,
-        vec![Arc::new(vectors), Arc::new(texts), Arc::new(tags)],
+        vec![
+            Arc::new(vectors),
+            Arc::new(texts),
+            Arc::new(tags),
+            Arc::new(memory_types),
+            Arc::new(created_ats),
+        ],
     )?)
 }
 
@@ -311,14 +555,74 @@ fn rows_to_batch(schema: SchemaRef, rows: &[MemoryRow]) -> Result<RecordBatch> {
 
     let texts = StringArray::from_iter_values(rows.iter().map(|r| r.text.as_str()));
     let tags = StringArray::from_iter_values(rows.iter().map(|r| r.tag.as_str()));
+    let memory_types = StringArray::from_iter_values(rows.iter().map(|r| r.memory_type.as_str()));
+    let created_ats = arrow_array::UInt64Array::from_iter_values(rows.iter().map(|r| r.created_at));
 
     Ok(RecordBatch::try_new(
         schema,
-        vec![Arc::new(vectors), Arc::new(texts), Arc::new(tags)],
+        vec![
+            Arc::new(vectors),
+            Arc::new(texts),
+            Arc::new(tags),
+            Arc::new(memory_types),
+            Arc::new(created_ats),
+        ],
     )?)
 }
 
+async fn process_file_if_changed(
+    embedder: &mut TextEmbedding,
+    table: &lancedb::Table,
+    state: &mut IndexState,
+    file_path: &Path,
+) -> Result<bool> {
+    let metadata = fs::metadata(file_path)?;
+    let mtime = metadata
+        .modified()?
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_secs();
+    let size = metadata.len();
+    let abs_path = fs::canonicalize(file_path)?;
+
+    // Check if we need to re-index
+    if let Some(existing) = state.files.get(&abs_path) {
+        if existing.mtime_secs == mtime && existing.size_bytes == size {
+            return Ok(false);
+        }
+    }
+
+    // Delete old memories for this file (using tag convention)
+    let tag = format!("code:{}", abs_path.display());
+    // Escape single quotes in predicate if necessary (simple version for now)
+    // LanceDB SQL predicate syntax: "tag = 'value'"
+    let predicate = format!("tag = '{}'", tag.replace('\'', "''"));
+    // Note: delete might fail if no rows exist, which is fine, but we should handle errors.
+    // However, LanceDB delete usually just returns rows deleted or OK.
+    let _ = table.delete(&predicate).await;
+
+    // Index new content
+    let rows = digest_file(embedder, file_path)?;
+    if !rows.is_empty() {
+        add_rows(table, rows).await?;
+    }
+
+    // Update state
+    state.files.insert(
+        abs_path,
+        FileMetadata {
+            mtime_secs: mtime,
+            size_bytes: size,
+            indexed_at: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs(),
+        },
+    );
+
+    Ok(true)
+}
+
 fn digest_file(embedder: &mut TextEmbedding, file_path: &Path) -> Result<Vec<MemoryRow>> {
+    let abs_path = fs::canonicalize(file_path).unwrap_or(file_path.to_path_buf());
     let content = fs::read_to_string(file_path)
         .with_context(|| format!("Failed to read {}", file_path.display()))?;
 
@@ -334,12 +638,17 @@ fn digest_file(embedder: &mut TextEmbedding, file_path: &Path) -> Result<Vec<Mem
     let refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
     let embeddings = embedder.embed(refs, None)?;
 
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_secs();
     let mut rows = Vec::with_capacity(chunks.len());
     for (chunk, vector) in chunks.into_iter().zip(embeddings.into_iter()) {
         rows.push(MemoryRow {
             vector,
             text: chunk,
-            tag: format!("code:{}", file_path.display()),
+            tag: format!("code:{}", abs_path.display()),
+            memory_type: "code".to_string(),
+            created_at: now,
         });
     }
 
@@ -438,10 +747,12 @@ async fn ask_table(table: &lancedb::Table, query: &[f32], limit: usize) -> Resul
     Ok(rows
         .into_iter()
         .enumerate()
-        .map(|(idx, (tag, text))| AskJsonResult {
+        .map(|(idx, (tag, text, memory_type, created_at))| AskJsonResult {
             rank: idx + 1,
             tag,
             text,
+            memory_type,
+            created_at,
         })
         .collect())
 }
@@ -449,7 +760,7 @@ async fn ask_table(table: &lancedb::Table, query: &[f32], limit: usize) -> Resul
 fn decode_rows(
     batches: &[RecordBatch],
     limit: Option<usize>,
-) -> Result<Vec<(Option<String>, String)>> {
+) -> Result<Vec<(Option<String>, String, String, u64)>> {
     let mut out = Vec::new();
 
     for batch in batches {
@@ -459,6 +770,12 @@ fn decode_rows(
         let text_col = batch
             .column_by_name("text")
             .context("Missing 'text' column")?;
+        let type_col = batch
+            .column_by_name("memory_type")
+            .context("Missing 'memory_type' column")?;
+        let time_col = batch
+            .column_by_name("created_at")
+            .context("Missing 'created_at' column")?;
 
         let tags = tag_col
             .as_any()
@@ -468,6 +785,14 @@ fn decode_rows(
             .as_any()
             .downcast_ref::<StringArray>()
             .context("Expected 'text' to be Utf8 StringArray")?;
+        let types = type_col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("Expected 'memory_type' to be Utf8 StringArray")?;
+        let times = time_col
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .context("Expected 'created_at' to be UInt64Array")?;
 
         for row in 0..batch.num_rows() {
             let tag = if tags.is_null(row) {
@@ -482,7 +807,15 @@ fn decode_rows(
                 texts.value(row).to_string()
             };
 
-            out.push((tag, text));
+            let mem_type = if types.is_null(row) {
+                "unknown".to_string()
+            } else {
+                types.value(row).to_string()
+            };
+
+            let created_at = times.value(row);
+
+            out.push((tag, text, mem_type, created_at));
             if let Some(limit) = limit {
                 if out.len() >= limit {
                     return Ok(out);

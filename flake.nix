@@ -19,10 +19,8 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
-        # Use fenix to get a minimal rust toolchain if needed, 
-        # or just use pkgs.rustPlatform (crane uses its own logic usually).
-        # We'll use the default stable toolchain.
-        craneLib = crane.lib.${system};
+        # Crane requires us to instantiate the library with our pkgs
+        craneLib = crane.mkLib pkgs;
 
         # Common native dependencies
         buildInputs = with pkgs; [

@@ -31,6 +31,7 @@
         nativeBuildInputs = with pkgs; [
           pkg-config
           makeWrapper
+          protobuf
         ];
 
         # Def to build the crate
@@ -39,6 +40,9 @@
           strictDeps = true;
 
           inherit buildInputs nativeBuildInputs;
+
+          # Fix for compiling lance/prost (protobuf)
+          PROTOC = "${pkgs.protobuf}/bin/protoc";
 
           # Fix for compiling openssl-sys
           OPENSSL_NO_VENDOR = 1;

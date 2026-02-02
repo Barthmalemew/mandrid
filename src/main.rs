@@ -9,14 +9,19 @@ use clap::{Parser, Subcommand};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::index::Index;
+use lancedb::index::scalar::{FtsIndexBuilder, FullTextSearchQuery};
+use lancedb::rerankers::rrf::RRFReranker;
 
 use arrow_array::types::Float32Type;
 use arrow_array::{Array, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 
+use tree_sitter::Parser as TSParser;
+use ignore::WalkBuilder;
+
 const DEFAULT_DB_PATH: &str = "./.mem_db";
 const DEFAULT_TABLE_NAME: &str = "memories";
-const STATE_FILE_NAME: &str = "index_state.json";
 const EMBEDDING_DIMS: i32 = 384;
 
 #[derive(Parser, Debug)]
@@ -39,6 +44,8 @@ enum Command {
         text: String,
         #[arg(long, default_value = "manual")]
         tag: String,
+        #[arg(long)]
+        session: Option<String>,
     },
 
     /// Record an agent interaction (reasoning trace/decision).
@@ -48,18 +55,32 @@ enum Command {
         /// Optional context tag (e.g. "auth-refactor")
         #[arg(long, default_value = "interaction")]
         tag: String,
+        #[arg(long)]
+        session: Option<String>,
     },
 
     /// Capture current context (git diff + reasoning) into memory.
     Capture {
         /// The reasoning or explanation for the current state/changes
         reasoning: String,
+        #[arg(long)]
+        session: Option<String>,
     },
 
     /// Get a briefing of recent decisions and relevant project context.
     Brief {
         /// How many recent decisions to include
         #[arg(long, default_value_t = 5)]
+        limit: usize,
+        #[arg(long)]
+        session: Option<String>,
+    },
+
+    /// Get optimized AI context for the current session.
+    Context {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, default_value_t = 10)]
         limit: usize,
     },
 
@@ -75,6 +96,9 @@ enum Command {
     Learn {
         #[arg(default_value = ".")]
         root_dir: PathBuf,
+        
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
     },
 
     /// Find relevant memories or code chunks.
@@ -86,6 +110,10 @@ enum Command {
 
         #[arg(long, default_value_t = 3)]
         limit: usize,
+
+        /// Disable Hybrid Search (use vector only)
+        #[arg(long)]
+        vector_only: bool,
     },
 
     /// Inspect the local LanceDB memory store.
@@ -93,6 +121,9 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         limit: usize,
     },
+
+    /// Show a high-level map of the codebase architecture.
+    Map,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -101,6 +132,8 @@ struct AskJsonResult {
     tag: Option<String>,
     text: String,
     memory_type: String,
+    file_path: Option<String>,
+    line_start: Option<u32>,
     created_at: u64,
 }
 
@@ -116,40 +149,12 @@ struct MemoryRow {
     text: String,
     tag: String,
     memory_type: String,
-    created_at: u64,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct FileMetadata {
+    file_path: String,
+    line_start: u32,
+    session_id: String,
     mtime_secs: u64,
     size_bytes: u64,
-    indexed_at: u64,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
-struct IndexState {
-    files: HashMap<PathBuf, FileMetadata>,
-}
-
-impl IndexState {
-    fn load(db_path: &Path) -> Result<Self> {
-        let state_path = db_path.join(STATE_FILE_NAME);
-        if !state_path.exists() {
-            return Ok(Self::default());
-        }
-        let content = fs::read_to_string(&state_path)?;
-        Ok(serde_json::from_str(&content).unwrap_or_default())
-    }
-
-    fn save(&self, db_path: &Path) -> Result<()> {
-        let state_path = db_path.join(STATE_FILE_NAME);
-        if let Some(parent) = state_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let content = serde_json::to_string_pretty(self)?;
-        fs::write(state_path, content)?;
-        Ok(())
-    }
+    created_at: u64,
 }
 
 #[tokio::main]
@@ -159,7 +164,7 @@ async fn main() -> Result<()> {
     let cache_dir = cli.cache_dir.clone();
 
     match cli.command {
-        Command::Save { text, tag } => {
+        Command::Save { text, tag, session } => {
             let mut embedder = init_embedder(cache_dir.clone(), true)?;
             let table = open_or_create_table(&db_path).await?;
 
@@ -172,12 +177,17 @@ async fn main() -> Result<()> {
                 text,
                 tag,
                 memory_type: "manual".to_string(),
+                file_path: "manual".to_string(),
+                line_start: 0,
+                session_id: session.unwrap_or_else(|| "default".to_string()),
+                mtime_secs: 0,
+                size_bytes: 0,
                 created_at: now,
             };
             add_rows(&table, vec![row]).await?;
             println!("Saved");
         }
-        Command::Log { text, tag } => {
+        Command::Log { text, tag, session } => {
             let mut embedder = init_embedder(cache_dir.clone(), true)?;
             let table = open_or_create_table(&db_path).await?;
 
@@ -190,12 +200,17 @@ async fn main() -> Result<()> {
                 text,
                 tag,
                 memory_type: "interaction".to_string(),
+                file_path: "interaction".to_string(),
+                line_start: 0,
+                session_id: session.unwrap_or_else(|| "default".to_string()),
+                mtime_secs: 0,
+                size_bytes: 0,
                 created_at: now,
             };
             add_rows(&table, vec![row]).await?;
             println!("Logged interaction");
         }
-        Command::Capture { reasoning } => {
+        Command::Capture { reasoning, session } => {
             let mut embedder = init_embedder(cache_dir.clone(), true)?;
             let table = open_or_create_table(&db_path).await?;
 
@@ -216,12 +231,17 @@ async fn main() -> Result<()> {
                 text: full_text,
                 tag: "capture".to_string(),
                 memory_type: "reasoning".to_string(),
+                file_path: "git".to_string(),
+                line_start: 0,
+                session_id: session.unwrap_or_else(|| "default".to_string()),
+                mtime_secs: 0,
+                size_bytes: 0,
                 created_at: now,
             };
             add_rows(&table, vec![row]).await?;
             println!("Context captured");
         }
-        Command::Brief { limit } => {
+        Command::Brief { limit, session } => {
             let table = open_table(&db_path).await.with_context(|| {
                 format!(
                     "Database/Table not found at {} (run `mem learn .` first)",
@@ -229,10 +249,16 @@ async fn main() -> Result<()> {
                 )
             })?;
 
+            let session_filter = if let Some(s) = session {
+                format!(" AND session_id = '{}'", s.replace('\'', "''"))
+            } else {
+                "".to_string()
+            };
+
             // 1. Get recent reasoning/decisions (System 2)
             let reasoning_stream = table
                 .query()
-                .only_if("memory_type = 'reasoning'")
+                .only_if(format!("memory_type = 'reasoning'{}", session_filter))
                 .limit(limit)
                 .execute()
                 .await?;
@@ -242,7 +268,7 @@ async fn main() -> Result<()> {
             // 2. Get top manual/knowledge facts (System 1)
             let knowledge_stream = table
                 .query()
-                .only_if("memory_type = 'manual' OR memory_type = 'interaction'")
+                .only_if(format!("(memory_type = 'manual' OR memory_type = 'interaction'){}", session_filter))
                 .limit(limit)
                 .execute()
                 .await?;
@@ -254,17 +280,49 @@ async fn main() -> Result<()> {
             if reasoning_rows.is_empty() {
                 println!("No reasoning traces found.");
             }
-            for (idx, (_tag, text, _type, _ts)) in reasoning_rows.into_iter().enumerate() {
-                println!("\n{}. {}", idx + 1, text);
+            for (idx, row) in reasoning_rows.into_iter().enumerate() {
+                println!("\n{}. {}", idx + 1, row.text);
             }
 
             println!("\n[Key Knowledge & Patterns]");
             if knowledge_rows.is_empty() {
                 println!("No manual context found.");
             }
-            for (idx, (tag, text, _type, _ts)) in knowledge_rows.into_iter().enumerate() {
-                println!("\n{}. [{}] {}", idx + 1, tag.unwrap_or_default(), text);
+            for (idx, row) in knowledge_rows.into_iter().enumerate() {
+                println!("\n{}. [{}] {}", idx + 1, row.tag.unwrap_or_default(), row.text);
             }
+        }
+        Command::Context { session, limit } => {
+            let table = open_table(&db_path).await.with_context(|| {
+                format!(
+                    "Database/Table not found at {} (run `mem learn .` first)",
+                    db_path.display()
+                )
+            })?;
+
+            let session_id = session.unwrap_or_else(|| "default".to_string());
+            let filter = format!("session_id = '{}' OR memory_type = 'manual'", session_id.replace('\'', "''"));
+
+            let stream = table
+                .query()
+                .only_if(filter)
+                .limit(limit)
+                .execute()
+                .await?;
+            
+            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+            let rows = decode_rows(&batches, None)?;
+
+            println!("<project_context>");
+            println!("## Active Session: {}", session_id);
+            for row in rows {
+                println!("\n## {} ({}) [Session: {}]", row.tag.unwrap_or_else(|| "unknown".to_string()), row.memory_type, row.session_id);
+                if row.memory_type == "code" {
+                    println!("File: {}:{}", row.file_path, row.line_start);
+                }
+                println!("{}", row.text);
+            }
+            println!("</project_context>");
         }
         Command::Init => {
             // 1. Create DB Directory
@@ -328,53 +386,109 @@ Do not edit `.mem_db/` manually.
             add_rows(&table, rows).await?;
             println!("Digested {}", file_path.display());
         }
-        Command::Learn { ref root_dir } => {
-            let mut embedder = init_embedder(cache_dir.clone(), true)?;
+        Command::Learn { ref root_dir, concurrency } => {
             let table = open_or_create_table(&db_path).await?;
-            let mut state = IndexState::load(&db_path)?;
+            
+            // 1. Get existing file metadata from DB
+            let stream = table.query().only_if("memory_type = 'code'").execute().await?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+            let existing_rows = decode_rows(&batches, None)?;
+            
+            let mut db_file_map: HashMap<PathBuf, (u64, u64)> = HashMap::new();
+            for row in existing_rows {
+                let path = PathBuf::from(row.file_path);
+                db_file_map.insert(path, (row.mtime_secs, row.size_bytes));
+            }
 
-            // 1. Garbage Collection (Pruning)
+            // 2. Garbage Collection (Pruning)
             let mut pruned = 0usize;
-            let tracked_files: Vec<PathBuf> = state.files.keys().cloned().collect();
-            for path in tracked_files {
+            for path in db_file_map.keys() {
                 if !path.exists() {
-                    // File deleted from disk, remove from DB and State
                     let tag = format!("code:{}", path.display());
                     let predicate = format!("tag = '{}'", tag.replace('\'', "''"));
                     let _ = table.delete(&predicate).await;
-                    
-                    state.files.remove(&path);
                     pruned += 1;
                     println!("Pruned missing file: {}", path.display());
                 }
             }
 
-            // 2. Indexing / Updating
-            let mut processed = 0usize;
-            let mut skipped = 0usize;
-            let mut errors = 0usize;
+            // 3. Indexing / Updating
+            let mut files_to_process = Vec::new();
+            for result in WalkBuilder::new(root_dir).build() {
+                let entry = result?;
+                let path = entry.path().to_path_buf();
+                if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    if is_supported_file(&path) {
+                        let metadata = fs::metadata(&path)?;
+                        let mtime = metadata.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+                        let size = metadata.len();
+                        let abs_path = fs::canonicalize(&path).unwrap_or(path.clone());
 
-            for file in walk_repo_files(root_dir)? {
-                match process_file_if_changed(&mut embedder, &table, &mut state, &file).await {
-                    Ok(true) => processed += 1,
-                    Ok(false) => skipped += 1,
-                    Err(e) => {
-                        eprintln!("Error processing {}: {}", file.display(), e);
-                        errors += 1;
+                        if let Some((db_mtime, db_size)) = db_file_map.get(&abs_path) {
+                            if *db_mtime == mtime && *db_size == size {
+                                continue;
+                            }
+                        }
+                        files_to_process.push(abs_path);
                     }
                 }
             }
-            state.save(&db_path)?;
+
+            println!("Found {} files to check/update", files_to_process.len());
+
+            let mut processed = 0usize;
+            let mut errors = 0usize;
+
+            for chunk in files_to_process.chunks(concurrency) {
+                let mut tasks = Vec::new();
+                for file in chunk {
+                    let file = file.clone();
+                    let cache_dir = cache_dir.clone();
+                    tasks.push(tokio::spawn(async move {
+                        let mut embedder = init_embedder(cache_dir, false)?;
+                        digest_file(&mut embedder, &file)
+                    }));
+                }
+
+                for task in tasks {
+                    match task.await? {
+                        Ok(rows) => {
+                            if !rows.is_empty() {
+                                let abs_path = PathBuf::from(&rows[0].file_path);
+                                let tag = format!("code:{}", abs_path.display());
+                                let predicate = format!("tag = '{}'", tag.replace('\'', "''"));
+                                let _ = table.delete(&predicate).await;
+                                
+                                add_rows(&table, rows).await?;
+                                processed += 1;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            errors += 1;
+                        }
+                    }
+                }
+            }
+
+            if processed > 0 || pruned > 0 {
+                println!("Updating Full-Text Search index...");
+                table
+                    .create_index(&["text"], Index::FTS(FtsIndexBuilder::default()))
+                    .execute()
+                    .await?;
+            }
 
             println!(
-                "Finished: {} processed, {} skipped, {} pruned, {} errors",
-                processed, skipped, pruned, errors
+                "Finished: {} processed, {} pruned, {} errors",
+                processed, pruned, errors
             );
         }
         Command::Ask {
             question,
             json_output,
             limit,
+            vector_only,
         } => {
             let mut embedder = init_embedder(cache_dir.clone(), !json_output)?;
             let table = open_table(&db_path).await.with_context(|| {
@@ -385,7 +499,7 @@ Do not edit `.mem_db/` manually.
             })?;
 
             let query_embedding = embed_prefixed(&mut embedder, "query", &question)?;
-            let results = ask_table(&table, &query_embedding, limit).await?;
+            let results = ask_table(&table, &query_embedding, &question, limit, vector_only).await?;
 
             if json_output {
                 let payload = AskJsonPayload {
@@ -397,7 +511,12 @@ Do not edit `.mem_db/` manually.
                 println!("Results for: '{question}'");
                 for result in results {
                     let tag = result.tag.unwrap_or_default();
-                    println!("\n{}. Tag: {}", result.rank, tag);
+                    let file_info = if let Some(path) = result.file_path {
+                        format!(" ({}:{})", path, result.line_start.unwrap_or(0))
+                    } else {
+                        "".to_string()
+                    };
+                    println!("\n{}. Tag: {}{}", result.rank, tag, file_info);
                     println!("{}", result.text);
                 }
             }
@@ -418,20 +537,76 @@ Do not edit `.mem_db/` manually.
             let rows = decode_rows(&batches, None)?;
 
             println!("\n___ RAW DATA INSPECTION ___");
-            for (idx, (tag, text, mem_type, created_at)) in rows.into_iter().enumerate() {
-                let status = if contains_brackets(&text) {
+            for (idx, row) in rows.into_iter().enumerate() {
+                let status = if contains_brackets(&row.text) {
                     "Brackets Found"
                 } else {
                     "No Brackets"
                 };
 
                 println!("\n--- Entry {} ({}) ---", idx + 1, status);
-                println!("Tag: {}", tag.unwrap_or_default());
-                println!("Type: {}", mem_type);
-                println!("Timestamp: {}", created_at);
+                println!("Tag: {}", row.tag.unwrap_or_default());
+                println!("Type: {}", row.memory_type);
+                println!("File: {}:{}", row.file_path, row.line_start);
+                println!("Timestamp: {}", row.created_at);
                 println!("Content:");
-                println!("{text}");
+                println!("{}", row.text);
                 println!("{}", "-".repeat(30));
+            }
+        }
+        Command::Map => {
+            let table = open_table(&db_path).await.with_context(|| {
+                format!(
+                    "Database/Table not found at {} (run `mem learn .` first)",
+                    db_path.display()
+                )
+            })?;
+
+            let stream = table
+                .query()
+                .only_if("memory_type = 'code'")
+                .execute()
+                .await?;
+            
+            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+            let rows = decode_rows(&batches, None)?;
+
+            let mut files: HashMap<String, Vec<String>> = HashMap::new();
+            for row in rows {
+                // Extract symbol from context tag or first line
+                let symbol = if let Some(first_line) = row.text.lines().next() {
+                    if first_line.starts_with("[Context:") {
+                        first_line.replace("[Context: ", "").replace(']', "")
+                    } else {
+                        // Fallback to a truncated version of the first line for non-structural chunks
+                        first_line.chars().take(60).collect::<String>()
+                    }
+                } else {
+                    "unknown".to_string()
+                };
+                files.entry(row.file_path).or_default().push(symbol);
+            }
+
+            println!("=== CODEBASE ARCHITECTURE MAP ===");
+            let mut sorted_files: Vec<_> = files.into_iter().collect();
+            sorted_files.sort_by(|a, b| a.0.cmp(&b.0));
+
+            for (path, symbols) in sorted_files {
+                let display_path = if let Ok(cwd) = std::env::current_dir() {
+                    Path::new(&path).strip_prefix(cwd).unwrap_or(Path::new(&path)).display().to_string()
+                } else {
+                    path
+                };
+                println!("\n📁 {}", display_path);
+                
+                let unique_symbols: HashSet<_> = symbols.into_iter().collect();
+                let mut sorted_symbols: Vec<_> = unique_symbols.into_iter().collect();
+                sorted_symbols.sort();
+                for sym in sorted_symbols {
+                    if !sym.trim().is_empty() {
+                        println!("  - {}", sym);
+                    }
+                }
             }
         }
     }
@@ -473,6 +648,11 @@ fn memory_schema() -> SchemaRef {
         Field::new("text", DataType::Utf8, false),
         Field::new("tag", DataType::Utf8, false),
         Field::new("memory_type", DataType::Utf8, false),
+        Field::new("file_path", DataType::Utf8, false),
+        Field::new("line_start", DataType::UInt32, false),
+        Field::new("session_id", DataType::Utf8, false),
+        Field::new("mtime_secs", DataType::UInt64, false),
+        Field::new("size_bytes", DataType::UInt64, false),
         Field::new("created_at", DataType::UInt64, false),
     ]))
 }
@@ -496,6 +676,13 @@ async fn open_or_create_table(db_path: &Path) -> Result<lancedb::Table> {
                 .create_table(DEFAULT_TABLE_NAME, Box::new(batches))
                 .execute()
                 .await?;
+            
+            // Create Full-Text Search index for hybrid precision
+            table
+                .create_index(&["text"], Index::FTS(FtsIndexBuilder::default()))
+                .execute()
+                .await?;
+
             Ok(table)
         }
     }
@@ -516,6 +703,11 @@ fn empty_record_batch(schema: SchemaRef) -> Result<RecordBatch> {
     let texts = StringArray::from_iter_values(std::iter::empty::<&str>());
     let tags = StringArray::from_iter_values(std::iter::empty::<&str>());
     let memory_types = StringArray::from_iter_values(std::iter::empty::<&str>());
+    let file_paths = StringArray::from_iter_values(std::iter::empty::<&str>());
+    let line_starts = arrow_array::UInt32Array::from_iter_values(std::iter::empty::<u32>());
+    let session_ids = StringArray::from_iter_values(std::iter::empty::<&str>());
+    let mtimes = arrow_array::UInt64Array::from_iter_values(std::iter::empty::<u64>());
+    let sizes = arrow_array::UInt64Array::from_iter_values(std::iter::empty::<u64>());
     let created_ats = arrow_array::UInt64Array::from_iter_values(std::iter::empty::<u64>());
 
     Ok(RecordBatch::try_new(
@@ -525,6 +717,11 @@ fn empty_record_batch(schema: SchemaRef) -> Result<RecordBatch> {
             Arc::new(texts),
             Arc::new(tags),
             Arc::new(memory_types),
+            Arc::new(file_paths),
+            Arc::new(line_starts),
+            Arc::new(session_ids),
+            Arc::new(mtimes),
+            Arc::new(sizes),
             Arc::new(created_ats),
         ],
     )?)
@@ -556,6 +753,11 @@ fn rows_to_batch(schema: SchemaRef, rows: &[MemoryRow]) -> Result<RecordBatch> {
     let texts = StringArray::from_iter_values(rows.iter().map(|r| r.text.as_str()));
     let tags = StringArray::from_iter_values(rows.iter().map(|r| r.tag.as_str()));
     let memory_types = StringArray::from_iter_values(rows.iter().map(|r| r.memory_type.as_str()));
+    let file_paths = StringArray::from_iter_values(rows.iter().map(|r| r.file_path.as_str()));
+    let line_starts = arrow_array::UInt32Array::from_iter_values(rows.iter().map(|r| r.line_start));
+    let session_ids = StringArray::from_iter_values(rows.iter().map(|r| r.session_id.as_str()));
+    let mtimes = arrow_array::UInt64Array::from_iter_values(rows.iter().map(|r| r.mtime_secs));
+    let sizes = arrow_array::UInt64Array::from_iter_values(rows.iter().map(|r| r.size_bytes));
     let created_ats = arrow_array::UInt64Array::from_iter_values(rows.iter().map(|r| r.created_at));
 
     Ok(RecordBatch::try_new(
@@ -565,60 +767,117 @@ fn rows_to_batch(schema: SchemaRef, rows: &[MemoryRow]) -> Result<RecordBatch> {
             Arc::new(texts),
             Arc::new(tags),
             Arc::new(memory_types),
+            Arc::new(file_paths),
+            Arc::new(line_starts),
+            Arc::new(session_ids),
+            Arc::new(mtimes),
+            Arc::new(sizes),
             Arc::new(created_ats),
         ],
     )?)
 }
 
-async fn process_file_if_changed(
-    embedder: &mut TextEmbedding,
-    table: &lancedb::Table,
-    state: &mut IndexState,
-    file_path: &Path,
-) -> Result<bool> {
-    let metadata = fs::metadata(file_path)?;
-    let mtime = metadata
-        .modified()?
-        .duration_since(SystemTime::UNIX_EPOCH)?
-        .as_secs();
-    let size = metadata.len();
-    let abs_path = fs::canonicalize(file_path)?;
+fn structural_chunk(content: &str, file_path: &Path) -> Vec<(String, u32)> {
+    let extension = file_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let language = match extension {
+        "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
+        "js" | "jsx" => Some(tree_sitter_javascript::LANGUAGE.into()),
+        "py" => Some(tree_sitter_python::LANGUAGE.into()),
+        _ => None,
+    };
 
-    // Check if we need to re-index
-    if let Some(existing) = state.files.get(&abs_path) {
-        if existing.mtime_secs == mtime && existing.size_bytes == size {
-            return Ok(false);
+    let Some(lang) = language else {
+        return chunk_text_line_aware(content, 500, 50);
+    };
+
+    let mut parser = TSParser::new();
+    parser.set_language(&lang).expect("Error loading grammar");
+    let tree = parser.parse(content, None).expect("Error parsing");
+    
+    let mut chunks = Vec::new();
+    let mut cursor = tree.walk();
+    let root = tree.root_node();
+
+    // Iterate through top-level nodes
+    for node in root.children(&mut cursor) {
+        let kind = node.kind();
+        let mut parent_context = String::new();
+
+        // Basic structural context propagation
+        if kind == "struct_item" || kind == "impl_item" || kind == "class_definition" || kind == "function_definition" {
+            // For impl/class, we want to capture the name to prefix children if we recurse
+            // For now, let's just label the top-level chunk
+            let name = node.child_by_field_name("name")
+                .or_else(|| node.child_by_field_name("declarator"))
+                .map(|n| &content[n.start_byte()..n.end_byte()])
+                .unwrap_or("unknown");
+            parent_context = format!("{} {}", kind, name);
+        }
+
+        let start_byte = node.start_byte();
+        let end_byte = node.end_byte();
+        let text = &content[start_byte..end_byte];
+        let start_line = node.start_position().row as u32 + 1;
+
+        if text.len() > 1000 {
+            for (sub_text, sub_line) in chunk_text_line_aware(text, 1000, 100) {
+                let context_text = if !parent_context.is_empty() {
+                    format!("[Context: {}]\n{}", parent_context, sub_text)
+                } else {
+                    sub_text
+                };
+                chunks.push((context_text, start_line + sub_line - 1));
+            }
+        } else if text.len() > 20 {
+            let context_text = if !parent_context.is_empty() {
+                format!("[Context: {}]\n{}", parent_context, text)
+            } else {
+                text.to_string()
+            };
+            chunks.push((context_text, start_line));
         }
     }
 
-    // Delete old memories for this file (using tag convention)
-    let tag = format!("code:{}", abs_path.display());
-    // Escape single quotes in predicate if necessary (simple version for now)
-    // LanceDB SQL predicate syntax: "tag = 'value'"
-    let predicate = format!("tag = '{}'", tag.replace('\'', "''"));
-    // Note: delete might fail if no rows exist, which is fine, but we should handle errors.
-    // However, LanceDB delete usually just returns rows deleted or OK.
-    let _ = table.delete(&predicate).await;
-
-    // Index new content
-    let rows = digest_file(embedder, file_path)?;
-    if !rows.is_empty() {
-        add_rows(table, rows).await?;
+    if chunks.is_empty() && !content.trim().is_empty() {
+        return chunk_text_line_aware(content, 500, 50);
     }
 
-    // Update state
-    state.files.insert(
-        abs_path,
-        FileMetadata {
-            mtime_secs: mtime,
-            size_bytes: size,
-            indexed_at: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)?
-                .as_secs(),
-        },
-    );
+    chunks
+}
 
-    Ok(true)
+fn chunk_text_line_aware(text: &str, chunk_size: usize, overlap: usize) -> Vec<(String, u32)> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let mut chunks = Vec::new();
+    let mut current_line = 0;
+
+    while current_line < lines.len() {
+        let mut current_chunk = String::new();
+        let mut lines_in_chunk = 0;
+        let start_line = current_line as u32 + 1;
+
+        while current_line < lines.len() && current_chunk.len() < chunk_size {
+            current_chunk.push_str(lines[current_line]);
+            current_chunk.push('\n');
+            current_line += 1;
+            lines_in_chunk += 1;
+        }
+
+        if !current_chunk.trim().is_empty() {
+            chunks.push((current_chunk, start_line));
+        }
+
+        if current_line < lines.len() {
+            // Move back for overlap
+            let back = lines_in_chunk.min(overlap / 50 + 1); // rough estimate
+            current_line = current_line.saturating_sub(back).max(current_line - lines_in_chunk + 1);
+        }
+    }
+
+    chunks
 }
 
 fn digest_file(embedder: &mut TextEmbedding, file_path: &Path) -> Result<Vec<MemoryRow>> {
@@ -626,14 +885,18 @@ fn digest_file(embedder: &mut TextEmbedding, file_path: &Path) -> Result<Vec<Mem
     let content = fs::read_to_string(file_path)
         .with_context(|| format!("Failed to read {}", file_path.display()))?;
 
-    let chunks = chunk_text(&content, 500, 50);
+    let metadata = fs::metadata(file_path)?;
+    let mtime_secs = metadata.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+    let size_bytes = metadata.len();
+
+    let chunks = structural_chunk(&content, file_path);
     if chunks.is_empty() {
         return Ok(Vec::new());
     }
 
     let docs: Vec<String> = chunks
         .iter()
-        .map(|chunk| format!("passage: {chunk}"))
+        .map(|(chunk, _)| format!("passage: {chunk}"))
         .collect();
     let refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
     let embeddings = embedder.embed(refs, None)?;
@@ -642,12 +905,17 @@ fn digest_file(embedder: &mut TextEmbedding, file_path: &Path) -> Result<Vec<Mem
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_secs();
     let mut rows = Vec::with_capacity(chunks.len());
-    for (chunk, vector) in chunks.into_iter().zip(embeddings.into_iter()) {
+    for ((chunk, line_start), vector) in chunks.into_iter().zip(embeddings.into_iter()) {
         rows.push(MemoryRow {
             vector,
             text: chunk,
             tag: format!("code:{}", abs_path.display()),
             memory_type: "code".to_string(),
+            file_path: abs_path.display().to_string(),
+            line_start,
+            session_id: "global".to_string(),
+            mtime_secs,
+            size_bytes,
             created_at: now,
         });
     }
@@ -655,91 +923,43 @@ fn digest_file(embedder: &mut TextEmbedding, file_path: &Path) -> Result<Vec<Mem
     Ok(rows)
 }
 
-fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
-    if chunk_size == 0 {
-        return Vec::new();
-    }
-
-    let bytes = text.as_bytes();
-    if bytes.is_empty() {
-        return Vec::new();
-    }
-
-    let mut chunks = Vec::new();
-    let mut start = 0usize;
-
-    let step = chunk_size.saturating_sub(overlap).max(1);
-    while start < bytes.len() {
-        let end = (start + chunk_size).min(bytes.len());
-        chunks.push(String::from_utf8_lossy(&bytes[start..end]).to_string());
-        if end == bytes.len() {
-            break;
-        }
-        start += step;
-    }
-
-    chunks
-}
-
-fn walk_repo_files(root_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
+fn is_supported_file(path: &Path) -> bool {
     let extensions: HashSet<&'static str> = [
-        "py", "rs", "js", "ts", "md", "txt", "nix", "go", "c", "cpp",
+        "py", "rs", "js", "ts", "jsx", "tsx", "md", "txt", "nix", "go", "c", "cpp", "h", "hpp",
     ]
     .into_iter()
     .collect();
-
-    for entry in walkdir::WalkDir::new(root_dir).into_iter().filter_map(Result::ok) {
-        let path = entry.path();
-
-        if should_ignore(path) {
-            continue;
-        }
-
-        if entry.file_type().is_file() {
-            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            if extensions.contains(ext) {
-                paths.push(path.to_path_buf());
-            }
-        }
-    }
-
-    Ok(paths)
-}
-
-fn should_ignore(path: &Path) -> bool {
-    let ignores: HashSet<&'static str> = [
-        ".git",
-        "__pycache__",
-        "venv",
-        "node_modules",
-        ".mem_db",
-        ".DS_Store",
-        "target",
-        "dist",
-        "result",
-    ]
-    .into_iter()
-    .collect();
-
-    path.components().any(|c| {
-        let part = c.as_os_str().to_string_lossy();
-        ignores.contains(part.as_ref())
-    })
+    
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    extensions.contains(ext)
 }
 
 fn contains_brackets(text: &str) -> bool {
     text.contains('[') && text.contains(']')
 }
 
-async fn ask_table(table: &lancedb::Table, query: &[f32], limit: usize) -> Result<Vec<AskJsonResult>> {
-    let stream = table
+async fn ask_table(
+    table: &lancedb::Table,
+    query_vector: &[f32],
+    query_text: &str,
+    limit: usize,
+    vector_only: bool,
+) -> Result<Vec<AskJsonResult>> {
+    let query_builder = table
         .query()
-        .nearest_to(query)
-        .context("Failed to build vector query")?
-        .limit(limit)
-        .execute()
-        .await?;
+        .nearest_to(query_vector)
+        .context("Failed to build vector query")?;
+
+    let stream = if vector_only {
+        query_builder.limit(limit).execute().await?
+    } else {
+        query_builder
+            .full_text_search(FullTextSearchQuery::new(query_text.to_owned()))
+            .rerank(Arc::new(RRFReranker::default()))
+            .limit(limit)
+            .execute()
+            .await?
+    };
 
     let batches: Vec<RecordBatch> = stream.try_collect().await?;
     let rows = decode_rows(&batches, Some(limit))?;
@@ -747,75 +967,80 @@ async fn ask_table(table: &lancedb::Table, query: &[f32], limit: usize) -> Resul
     Ok(rows
         .into_iter()
         .enumerate()
-        .map(|(idx, (tag, text, memory_type, created_at))| AskJsonResult {
+        .map(|(idx, row)| AskJsonResult {
             rank: idx + 1,
-            tag,
-            text,
-            memory_type,
-            created_at,
+            tag: row.tag,
+            text: row.text,
+            memory_type: row.memory_type,
+            file_path: Some(row.file_path),
+            line_start: Some(row.line_start),
+            created_at: row.created_at,
         })
         .collect())
+}
+
+struct DecodedRow {
+    tag: Option<String>,
+    text: String,
+    memory_type: String,
+    file_path: String,
+    line_start: u32,
+    session_id: String,
+    mtime_secs: u64,
+    size_bytes: u64,
+    created_at: u64,
 }
 
 fn decode_rows(
     batches: &[RecordBatch],
     limit: Option<usize>,
-) -> Result<Vec<(Option<String>, String, String, u64)>> {
+) -> Result<Vec<DecodedRow>> {
     let mut out = Vec::new();
 
     for batch in batches {
-        let tag_col = batch
-            .column_by_name("tag")
-            .context("Missing 'tag' column")?;
-        let text_col = batch
-            .column_by_name("text")
-            .context("Missing 'text' column")?;
-        let type_col = batch
-            .column_by_name("memory_type")
-            .context("Missing 'memory_type' column")?;
-        let time_col = batch
-            .column_by_name("created_at")
-            .context("Missing 'created_at' column")?;
+        let tag_col = batch.column_by_name("tag").context("Missing 'tag' column")?;
+        let text_col = batch.column_by_name("text").context("Missing 'text' column")?;
+        let type_col = batch.column_by_name("memory_type").context("Missing 'memory_type' column")?;
+        let path_col = batch.column_by_name("file_path").context("Missing 'file_path' column")?;
+        let line_col = batch.column_by_name("line_start").context("Missing 'line_start' column")?;
+        let session_col = batch.column_by_name("session_id").context("Missing 'session_id' column")?;
+        let mtime_col = batch.column_by_name("mtime_secs").context("Missing 'mtime_secs' column")?;
+        let size_col = batch.column_by_name("size_bytes").context("Missing 'size_bytes' column")?;
+        let time_col = batch.column_by_name("created_at").context("Missing 'created_at' column")?;
 
-        let tags = tag_col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("Expected 'tag' to be Utf8 StringArray")?;
-        let texts = text_col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("Expected 'text' to be Utf8 StringArray")?;
-        let types = type_col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("Expected 'memory_type' to be Utf8 StringArray")?;
-        let times = time_col
-            .as_any()
-            .downcast_ref::<arrow_array::UInt64Array>()
-            .context("Expected 'created_at' to be UInt64Array")?;
+        let tags = tag_col.as_any().downcast_ref::<StringArray>().context("Expected 'tag' to be Utf8 StringArray")?;
+        let texts = text_col.as_any().downcast_ref::<StringArray>().context("Expected 'text' to be Utf8 StringArray")?;
+        let types = type_col.as_any().downcast_ref::<StringArray>().context("Expected 'memory_type' to be Utf8 StringArray")?;
+        let paths = path_col.as_any().downcast_ref::<StringArray>().context("Expected 'file_path' to be Utf8 StringArray")?;
+        let lines = line_col.as_any().downcast_ref::<arrow_array::UInt32Array>().context("Expected 'line_start' to be UInt32Array")?;
+        let sessions = session_col.as_any().downcast_ref::<StringArray>().context("Expected 'session_id' to be Utf8 StringArray")?;
+        let mtimes = mtime_col.as_any().downcast_ref::<arrow_array::UInt64Array>().context("Expected 'mtime_secs' to be UInt64Array")?;
+        let sizes = size_col.as_any().downcast_ref::<arrow_array::UInt64Array>().context("Expected 'size_bytes' to be UInt64Array")?;
+        let times = time_col.as_any().downcast_ref::<arrow_array::UInt64Array>().context("Expected 'created_at' to be UInt64Array")?;
 
         for row in 0..batch.num_rows() {
-            let tag = if tags.is_null(row) {
-                None
-            } else {
-                Some(tags.value(row).to_string())
-            };
-
-            let text = if texts.is_null(row) {
-                String::new()
-            } else {
-                texts.value(row).to_string()
-            };
-
-            let mem_type = if types.is_null(row) {
-                "unknown".to_string()
-            } else {
-                types.value(row).to_string()
-            };
-
+            let tag = if tags.is_null(row) { None } else { Some(tags.value(row).to_string()) };
+            let text = if texts.is_null(row) { String::new() } else { texts.value(row).to_string() };
+            let mem_type = if types.is_null(row) { "unknown".to_string() } else { types.value(row).to_string() };
+            let path = if paths.is_null(row) { "unknown".to_string() } else { paths.value(row).to_string() };
+            let line = lines.value(row);
+            let session = if sessions.is_null(row) { "default".to_string() } else { sessions.value(row).to_string() };
+            let mtime = mtimes.value(row);
+            let size = sizes.value(row);
             let created_at = times.value(row);
 
-            out.push((tag, text, mem_type, created_at));
+            out.push(DecodedRow {
+                tag,
+                text,
+                memory_type: mem_type,
+                file_path: path,
+                line_start: line,
+                session_id: session,
+                mtime_secs: mtime,
+                size_bytes: size,
+                created_at,
+            });
+            
             if let Some(limit) = limit {
                 if out.len() >= limit {
                     return Ok(out);

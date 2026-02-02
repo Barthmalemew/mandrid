@@ -23,10 +23,11 @@ Mandrid is a high-performance, local-first AI memory layer designed to outperfor
 - [x] **Filesystem Watcher (`mem watch`):** Automatically re-indexes files on save.
 - [x] **LSP Sidecar (`mem lsp`):** A minimal LSP server that receives real-time code changes from your editor (even unsaved buffers).
 - [x] **Modular Architecture:** Refactored into `db`, `chunker`, and `task` modules for scalability.
+- [x] **Automated Command Tracing (`mem run`):** Executes a command and automatically records stdout/stderr/status to episodic memory.
 
 ## 🚀 Features in Progress
 
-- [ ] **Implicit Trace-Streaming:** Automatically capturing reasoning from terminal errors and edits.
+- [ ] **Implicit Trace-Streaming:** Integrating `mem run` logic into shell hooks for zero-effort capture.
 
 
 ## 📅 Potential / Future Features

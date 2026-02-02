@@ -155,6 +155,17 @@ enum Command {
 
     /// Start a minimal LSP server to receive real-time code changes.
     Lsp,
+
+    /// Execute a command and automatically record its output and result to memory.
+    Run {
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+        #[arg(long)]
+        session: Option<String>,
+        /// Custom reasoning or label for this execution
+        #[arg(long)]
+        note: Option<String>,
+    },
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -625,6 +636,63 @@ Run `mem context` to start.
                 }
             }
             io_threads.join()?;
+        }
+        Command::Run { command, session, note } => {
+            if command.is_empty() {
+                anyhow::bail!("No command provided to run.");
+            }
+
+            let full_command = command.join(" ");
+            println!("🚀 Mandrid running: {}", full_command);
+
+            let start_time = SystemTime::now();
+            let output = std::process::Command::new(&command[0])
+                .args(&command[1..])
+                .output()?;
+            let end_time = SystemTime::now();
+            let duration = end_time.duration_since(start_time).unwrap_or_default();
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let status = output.status.code().unwrap_or(-1);
+
+            // Print output to user
+            if !stdout.is_empty() { print!("{}", stdout); }
+            if !stderr.is_empty() { eprintln!("{}", stderr); }
+
+            let mut embedder = init_embedder(cache_dir.clone(), false)?;
+            let table = open_or_create_table(&db_path).await?;
+
+            let reasoning = format!(
+                "Command: {}\nStatus: {}\nDuration: {:?}\nNote: {}\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
+                full_command,
+                status,
+                duration,
+                note.unwrap_or_else(|| "Automated trace".to_string()),
+                stdout,
+                stderr
+            );
+
+            let embedding = embed_prefixed(&mut embedder, "trace", &reasoning)?;
+            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+            
+            let row = MemoryRow {
+                vector: embedding,
+                text: reasoning,
+                tag: format!("run:{}", command[0]),
+                memory_type: "trace".to_string(),
+                file_path: "terminal".to_string(),
+                line_start: 0,
+                session_id: session.unwrap_or_else(|| "default".to_string()),
+                depends_on: "[]".to_string(),
+                status: if status == 0 { "success".to_string() } else { "failure".to_string() },
+                mtime_secs: 0,
+                size_bytes: 0,
+                created_at: now,
+            };
+
+            add_rows(&table, vec![row]).await?;
+            println!("\n✅ Interaction recorded to Mandrid.");
         }
     }
     Ok(())

@@ -20,10 +20,12 @@ Mandrid is a high-performance, local-first AI memory layer designed to outperfor
 - [x] **Task-Aware Context Injection:** `mem context` automatically highlights active goals and dependencies.
 - [x] **Task-Aware Retrieval:** `mem ask --task-aware` boosts results based on the current active task description.
 - [x] **Cross-Encoder Reranking:** Integrated `BGE-Reranker-Base` via FastEmbed for hyper-precision (`mem ask --rerank`).
+- [x] **Filesystem Watcher (`mem watch`):** Automatically re-indexes files on save.
+- [x] **LSP Sidecar (`mem lsp`):** A minimal LSP server that receives real-time code changes from your editor (even unsaved buffers).
 
 ## 🚀 Features in Progress
 
-- [ ] **LSP Hooking:** Integrating with Language Server Protocol to see code changes in real-time.
+- [ ] **Implicit Trace-Streaming:** Automatically capturing reasoning from terminal errors and edits.
 
 
 ## 📅 Potential / Future Features

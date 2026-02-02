@@ -19,6 +19,13 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 
 use tree_sitter::Parser as TSParser;
 use ignore::WalkBuilder;
+use notify::{Watcher, RecursiveMode, Config, RecommendedWatcher};
+use std::sync::mpsc::channel;
+use lsp_server::{Connection, Message};
+use lsp_types::{
+    InitializeParams, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, notification::{DidChangeTextDocument, DidSaveTextDocument, Notification},
+};
 
 const DEFAULT_DB_PATH: &str = "./.mem_db";
 const DEFAULT_TABLE_NAME: &str = "memories";
@@ -165,6 +172,15 @@ enum Command {
 
     /// Show a high-level map of the codebase architecture.
     Map,
+
+    /// Watch the filesystem for changes and automatically re-index files.
+    Watch {
+        #[arg(default_value = ".")]
+        root_dir: PathBuf,
+    },
+
+    /// Start a minimal LSP server to receive real-time code changes from an editor.
+    Lsp,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -865,6 +881,136 @@ Do not edit `.mem_db/` manually.
                     }
                 }
             }
+        }
+        Command::Watch { root_dir } => {
+            println!("👀 Mandrid is watching for changes in {}...", root_dir.display());
+            println!("(Press Ctrl+C to stop)");
+
+            let (tx, rx) = channel();
+            let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
+            watcher.watch(&root_dir, RecursiveMode::Recursive)?;
+
+            let table = open_or_create_table(&db_path).await?;
+            let mut embedder = init_embedder(cache_dir.clone(), false)?;
+
+            for res in rx {
+                match res {
+                    Ok(event) => {
+                        for path in event.paths {
+                            if is_supported_file(&path) {
+                                println!("Detected change in: {}", path.display());
+                                match digest_file(&mut embedder, &path) {
+                                    Ok(rows) => {
+                                        if !rows.is_empty() {
+                                            let abs_path = fs::canonicalize(&path).unwrap_or(path.clone());
+                                            let tag = format!("code:{}", abs_path.display());
+                                            let predicate = format!("tag = '{}'", tag.replace('\'', "''"));
+                                            let _ = table.delete(&predicate).await;
+                                            
+                                            if let Err(e) = add_rows(&table, rows).await {
+                                                eprintln!("Error adding rows: {}", e);
+                                            } else {
+                                                println!("Successfully re-indexed {}", path.display());
+                                            }
+                                        }
+                                    }
+                                    Err(e) => eprintln!("Error digesting {}: {}", path.display(), e),
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("Watch error: {:?}", e),
+                }
+            }
+        }
+        Command::Lsp => {
+            eprintln!("🚀 Mandrid LSP started. Connect your editor to this process.");
+            let (connection, io_threads) = Connection::stdio();
+
+            let server_capabilities = serde_json::to_value(&ServerCapabilities {
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::FULL),
+                        save: Some(lsp_types::TextDocumentSyncSaveOptions::SaveOptions(
+                            lsp_types::SaveOptions { include_text: Some(true) },
+                        )),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            })?;
+
+            let initialization_params = connection.initialize(server_capabilities)?;
+            let _params: InitializeParams = serde_json::from_value(initialization_params)?;
+
+            let table = open_or_create_table(&db_path).await?;
+            let mut embedder = init_embedder(cache_dir.clone(), false)?;
+
+            for msg in &connection.receiver {
+                match msg {
+                    Message::Request(req) => {
+                        if connection.handle_shutdown(&req)? {
+                            break;
+                        }
+                    }
+                    Message::Notification(not) => {
+                        if not.method == DidChangeTextDocument::METHOD || not.method == DidSaveTextDocument::METHOD {
+                            let params: lsp_types::DidChangeTextDocumentParams = if not.method == DidChangeTextDocument::METHOD {
+                                serde_json::from_value(not.params)?
+                            } else {
+                                // DidSave has different params, but we just want the text
+                                continue; // Simplification: only handle changes for now
+                            };
+
+                            let uri = params.text_document.uri;
+                            if let Ok(path) = uri.to_file_path() {
+                                if is_supported_file(&path) {
+                                    if let Some(change) = params.content_changes.first() {
+                                        let content = &change.text;
+                                        let chunks = structural_chunk(content, &path);
+                                        
+                                        if !chunks.is_empty() {
+                                            let abs_path = fs::canonicalize(&path).unwrap_or(path.clone());
+                                            let tag = format!("code:{}", abs_path.display());
+                                            let predicate = format!("tag = '{}'", tag.replace('\'', "''"));
+                                            let _ = table.delete(&predicate).await;
+
+                                            // Embed and add
+                                            let docs: Vec<String> = chunks.iter().map(|(c, _)| format!("passage: {c}")).collect();
+                                            let refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
+                                            let embeddings = embedder.embed(refs, None)?;
+                                            
+                                            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+                                            let mut rows = Vec::new();
+                                            for ((chunk, line_start), vector) in chunks.into_iter().zip(embeddings.into_iter()) {
+                                                rows.push(MemoryRow {
+                                                    vector,
+                                                    text: chunk,
+                                                    tag: tag.clone(),
+                                                    memory_type: "code".to_string(),
+                                                    file_path: abs_path.display().to_string(),
+                                                    line_start,
+                                                    session_id: "lsp-live".to_string(),
+                                                    depends_on: "[]".to_string(),
+                                                    status: "n/a".to_string(),
+                                                    mtime_secs: 0,
+                                                    size_bytes: 0,
+                                                    created_at: now,
+                                                });
+                                            }
+                                            let _ = add_rows(&table, rows).await;
+                                            eprintln!("Live-updated memory for {}", path.display());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            io_threads.join()?;
         }
     }
 

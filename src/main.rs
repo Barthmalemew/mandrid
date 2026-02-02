@@ -513,64 +513,50 @@ Run `mem context` to start.
                 }
                 TaskCommand::Start { name } => {
                     let predicate = format!("tag = 'task:{}'", name.replace('\'', "''"));
-                    let stream = table.query().only_if(&predicate).execute().await?;
-                    let batches: Vec<RecordBatch> = stream.try_collect().await?;
-                    let rows = decode_rows(&batches, None)?;
-                    
-                    if let Some(row) = rows.first() {
-                        let mut new_row = MemoryRow {
-                            vector: vec![0.0; EMBEDDING_DIMS as usize],
-                            text: row.text.clone(),
-                            tag: row.tag.clone().unwrap(),
-                            memory_type: "task".to_string(),
-                            file_path: row.file_path.clone(),
-                            line_start: row.line_start,
-                            session_id: row.session_id.clone(),
-                            depends_on: row.depends_on.clone(),
-                            status: "active".to_string(),
-                            mtime_secs: 0,
-                            size_bytes: 0,
-                            created_at: now,
-                        };
-                        new_row.vector = embed_prefixed(&mut embedder, "task", &new_row.text)?;
-                        
-                        let _ = table.delete(predicate.as_str()).await;
-                        add_rows(&table, vec![new_row]).await?;
-                        println!("Task '{}' started.", name);
-                    } else {
-                        println!("Task '{}' not found.", name);
-                    }
+                    table.update()
+                        .only_if(&predicate)
+                        .column("status", "'active'")
+                        .execute()
+                        .await?;
+                    println!("Task '{}' started.", name);
                 }
                 TaskCommand::Finish { name } => {
                     let predicate = format!("tag = 'task:{}'", name.replace('\'', "''"));
-                    let stream = table.query().only_if(&predicate).execute().await?;
-                    let batches: Vec<RecordBatch> = stream.try_collect().await?;
-                    let rows = decode_rows(&batches, None)?;
-                    
-                    if let Some(row) = rows.first() {
-                        let mut new_row = MemoryRow {
-                            vector: vec![0.0; EMBEDDING_DIMS as usize],
-                            text: row.text.clone(),
-                            tag: row.tag.clone().unwrap(),
-                            memory_type: "task".to_string(),
-                            file_path: row.file_path.clone(),
-                            line_start: row.line_start,
-                            session_id: row.session_id.clone(),
-                            depends_on: row.depends_on.clone(),
-                            status: "completed".to_string(),
-                            mtime_secs: 0,
-                            size_bytes: 0,
-                            created_at: now,
-                        };
-                        new_row.vector = embed_prefixed(&mut embedder, "task", &new_row.text)?;
-                        
-                        let _ = table.delete(predicate.as_str()).await;
-                        add_rows(&table, vec![new_row]).await?;
-                        println!("Task '{}' finished.", name);
-                    } else {
-                        println!("Task '{}' not found.", name);
-                    }
+                    table.update()
+                        .only_if(&predicate)
+                        .column("status", "'completed'")
+                        .execute()
+                        .await?;
+                    println!("Task '{}' finished.", name);
                 }
+            }
+        }
+        Command::Debug { limit } => {
+            let table = open_table(&db_path).await.with_context(|| {
+                format!(
+                    "Database/Table not found at {} (run `mem learn .` first)",
+                    db_path.display()
+                )
+            })?;
+
+            let count = table.count_rows(None).await?;
+            println!("Total Memories: {count}");
+
+            let stream = table.query().limit(limit).execute().await?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+            let rows = decode_rows(&batches, None)?;
+
+            println!("\n___ RAW DATA INSPECTION ___");
+            for (idx, row) in rows.into_iter().enumerate() {
+                println!("\n--- Entry {} ---", idx + 1);
+                println!("Tag: {}", row.tag.unwrap_or_default());
+                println!("Type: {}", row.memory_type);
+                println!("Session: {}", row.session_id);
+                println!("File: {}:{}", row.file_path, row.line_start);
+                println!("Timestamp: {}", row.created_at);
+                println!("Content:");
+                println!("{}", row.text);
+                println!("{}", "-".repeat(30));
             }
         }
         Command::Map => {
@@ -640,7 +626,6 @@ Run `mem context` to start.
             }
             io_threads.join()?;
         }
-        _ => {}
     }
     Ok(())
 }

@@ -27,8 +27,16 @@ use lsp_types::{
     TextDocumentSyncOptions, notification::{DidChangeTextDocument, Notification},
 };
 
-use crate::db::*;
+use axum::{
+    extract::State,
+    response::Html,
+    routing::get,
+    Json, Router,
+};
+use tower_http::cors::CorsLayer;
+
 use crate::chunker::*;
+use crate::db::*;
 use crate::task::*;
 
 const DEFAULT_DB_PATH: &str = "./.mem_db";
@@ -82,13 +90,15 @@ enum Command {
         session: Option<String>,
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Filter context by a specific file path
+        #[arg(long)]
+        file: Option<PathBuf>,
         /// Output in a more human-friendly format
         #[arg(long)]
         human: bool,
     },
 
     /// Manage high-level development tasks.
-
     Task {
         #[command(subcommand)]
         subcommand: TaskCommand,
@@ -110,7 +120,7 @@ enum Command {
     Learn {
         #[arg(default_value = ".")]
         root_dir: PathBuf,
-        
+
         #[arg(long, default_value_t = 4)]
         concurrency: usize,
     },
@@ -151,6 +161,25 @@ enum Command {
     Watch {
         #[arg(default_value = ".")]
         root_dir: PathBuf,
+    },
+
+    /// Show all symbols (functions, structs, etc.) found in the codebase.
+    Symbols {
+        /// Filter by name or file
+        #[arg(short, long)]
+        query: Option<String>,
+    },
+
+    /// Automatically sync git history into reasoning traces.
+    SyncGit {
+        #[arg(long, default_value_t = 10)]
+        commits: usize,
+    },
+
+    /// Launch the Mandrid Web Dashboard.
+    Serve {
+        #[arg(long, default_value_t = 3000)]
+        port: u16,
     },
 
     /// Start a minimal LSP server to receive real-time code changes.
@@ -206,6 +235,8 @@ async fn main() -> Result<()> {
                 file_path: "manual".to_string(),
                 line_start: 0,
                 session_id: session.unwrap_or_else(|| "default".to_string()),
+                name: String::new(),
+                references: "[]".to_string(),
                 depends_on: "[]".to_string(),
                 status: "n/a".to_string(),
                 mtime_secs: 0,
@@ -229,6 +260,8 @@ async fn main() -> Result<()> {
                 file_path: "interaction".to_string(),
                 line_start: 0,
                 session_id: session.unwrap_or_else(|| "default".to_string()),
+                name: String::new(),
+                references: "[]".to_string(),
                 depends_on: "[]".to_string(),
                 status: "n/a".to_string(),
                 mtime_secs: 0,
@@ -260,6 +293,8 @@ async fn main() -> Result<()> {
                 file_path: "git".to_string(),
                 line_start: 0,
                 session_id: session.unwrap_or_else(|| "default".to_string()),
+                name: String::new(),
+                references: "[]".to_string(),
                 depends_on: "[]".to_string(),
                 status: "n/a".to_string(),
                 mtime_secs: 0,
@@ -269,7 +304,7 @@ async fn main() -> Result<()> {
             add_rows(&table, vec![row]).await?;
             println!("Context captured");
         }
-        Command::Context { session, limit, human } => {
+        Command::Context { session, limit, file, human } => {
             let table = open_table(&db_path).await.with_context(|| {
                 format!("Database not found at {}. Run `mem init` first.", db_path.display())
             })?;
@@ -287,7 +322,12 @@ async fn main() -> Result<()> {
             let task_batches: Vec<RecordBatch> = task_stream.try_collect().await?;
             let active_tasks = decode_rows(&task_batches, None)?;
 
-            let filter = format!("session_id = '{}' OR memory_type = 'manual' OR memory_type = 'task'", session_id.replace('\'', "''"));
+            let mut filter = format!("(session_id = '{}' OR memory_type = 'manual' OR memory_type = 'task')", session_id.replace('\'', "''"));
+            
+            if let Some(f) = file {
+                let abs_path = fs::canonicalize(&f).unwrap_or(f);
+                filter.push_str(&format!(" AND (file_path = '{}' OR memory_type = 'manual' OR memory_type = 'task')", abs_path.display().to_string().replace('\'', "''")));
+            }
 
             let stream = table.query().only_if(filter).limit(limit).execute().await?;
             let batches: Vec<RecordBatch> = stream.try_collect().await?;
@@ -347,6 +387,8 @@ async fn main() -> Result<()> {
                 file_path: "config".to_string(),
                 line_start: 0,
                 session_id: "global".to_string(),
+                name: String::new(),
+                references: "[]".to_string(),
                 depends_on: "[]".to_string(),
                 status: "active".to_string(),
                 mtime_secs: 0,
@@ -498,6 +540,8 @@ Run `mem context` to start.
                         file_path: "task".to_string(),
                         line_start: 0,
                         session_id: "global".to_string(),
+                        name: name.clone(),
+                        references: "[]".to_string(),
                         depends_on: serde_json::to_string(&depends_on)?,
                         status: "pending".to_string(),
                         mtime_secs: 0,
@@ -584,6 +628,81 @@ Run `mem context` to start.
                 println!("\n📁 {}", path);
                 for s in symbols { println!("  - {}", s); }
             }
+        }
+        Command::Symbols { query } => {
+            let table = open_table(&db_path).await?;
+            let mut filter = "memory_type = 'code'".to_string();
+            if let Some(ref q) = query {
+                filter.push_str(&format!(" AND text LIKE '%{}%'", q.replace('\'', "''")));
+            }
+
+            let stream = table.query().only_if(filter).execute().await?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+            let rows = decode_rows(&batches, None)?;
+
+            println!("=== DETERMINISTIC SYMBOL MAP ===");
+            for row in rows {
+                if let Some(first_line) = row.text.lines().next() {
+                    if first_line.starts_with("[Context:") {
+                        let symbol = first_line.replace("[Context: ", "").replace(']', "");
+                        println!("{} -> {}:{}", symbol, row.file_path, row.line_start);
+                    }
+                }
+            }
+        }
+        Command::SyncGit { commits } => {
+            let table = open_or_create_table(&db_path).await?;
+            let mut embedder = init_embedder(cache_dir.clone(), true)?;
+            let output = std::process::Command::new("git")
+                .args(["log", "-p", &format!("-n{}", commits)])
+                .output()?;
+            let log = String::from_utf8_lossy(&output.stdout);
+            
+            for commit_block in log.split("commit ").skip(1) {
+                let full_text = format!("commit {}", commit_block);
+                let embedding = embed_prefixed(&mut embedder, "passage", &full_text)?;
+                let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+                let row = MemoryRow {
+                    vector: embedding,
+                    text: full_text,
+                    tag: "git:history".to_string(),
+                    memory_type: "git_reasoning".to_string(),
+                    file_path: "git".to_string(),
+                    line_start: 0,
+                    session_id: "global".to_string(),
+                    name: "commit".to_string(),
+                    references: "[]".to_string(),
+                    depends_on: "[]".to_string(),
+                    status: "n/a".to_string(),
+                    mtime_secs: 0,
+                    size_bytes: 0,
+                    created_at: now,
+                };
+                add_rows(&table, vec![row]).await?;
+            }
+            println!("Synced {} commits.", commits);
+        }
+        Command::Serve { port } => {
+            let db_p = db_path.clone();
+            
+            let app = Router::new()
+                .route("/", get(|| async { Html(include_str!("dashboard.html")) }))
+                .route("/api/memories", get(move |State(db_p): State<PathBuf>| async move {
+                    let table = match open_table(&db_p).await {
+                        Ok(t) => t,
+                        Err(_) => return Json(vec![]),
+                    };
+                    let stream = table.query().limit(100).execute().await.unwrap();
+                    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+                    let rows = decode_rows(&batches, None).unwrap_or_default();
+                    Json(rows)
+                }))
+                .layer(CorsLayer::permissive())
+                .with_state(db_p);
+
+            let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+            println!("🚀 Mandrid Dashboard at http://localhost:{}", port);
+            axum::serve(listener, app).await?;
         }
         Command::Watch { root_dir } => {
             let (tx, rx) = channel();
@@ -684,6 +803,8 @@ Run `mem context` to start.
                 file_path: "terminal".to_string(),
                 line_start: 0,
                 session_id: session.unwrap_or_else(|| "default".to_string()),
+                name: command[0].clone(),
+                references: "[]".to_string(),
                 depends_on: "[]".to_string(),
                 status: if status == 0 { "success".to_string() } else { "failure".to_string() },
                 mtime_secs: 0,
@@ -706,17 +827,26 @@ fn digest_file_logic(embedder: &mut TextEmbedding, path: &Path) -> Result<Vec<Me
 
 fn digest_file_content_logic(embedder: &mut TextEmbedding, content: &str, path: &Path) -> Result<Vec<MemoryRow>> {
     let chunks = structural_chunk(content, path);
-    let docs: Vec<String> = chunks.iter().map(|(c, _)| format!("passage: {c}")).collect();
-    let refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
-    let embeddings = embedder.embed(refs, None)?;
+    let docs: Vec<String> = chunks.iter().map(|c| format!("passage: {}", c.text)).collect();
+    let refs_to_embed: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
+    let embeddings = embedder.embed(refs_to_embed, None)?;
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
     let metadata = fs::metadata(path)?;
-    Ok(chunks.into_iter().zip(embeddings.into_iter()).map(|((text, line_start), vector)| MemoryRow {
-        vector, text, tag: format!("code:{}", path.display()), memory_type: "code".to_string(),
-        file_path: path.display().to_string(), line_start, session_id: "global".to_string(),
-        depends_on: "[]".to_string(), status: "n/a".to_string(),
+    Ok(chunks.into_iter().zip(embeddings.into_iter()).map(|(chunk, vector)| MemoryRow {
+        vector,
+        text: chunk.text,
+        tag: format!("code:{}", path.display()),
+        memory_type: "code".to_string(),
+        file_path: path.display().to_string(),
+        line_start: chunk.line,
+        session_id: "global".to_string(),
+        name: chunk.name,
+        references: serde_json::to_string(&chunk.references).unwrap_or_else(|_| "[]".to_string()),
+        depends_on: "[]".to_string(),
+        status: "n/a".to_string(),
         mtime_secs: metadata.modified().unwrap().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
-        size_bytes: metadata.len(), created_at: now
+        size_bytes: metadata.len(),
+        created_at: now
     }).collect())
 }
 

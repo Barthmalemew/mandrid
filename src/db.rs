@@ -22,6 +22,8 @@ pub struct MemoryRow {
     pub file_path: String,
     pub line_start: u32,
     pub session_id: String,
+    pub name: String,       // Symbol name (e.g. "main")
+    pub references: String, // JSON list of calls/imports
     pub depends_on: String, // JSON list
     pub status: String,     // "pending", "active", "completed", "n/a"
     pub mtime_secs: u64,
@@ -29,7 +31,7 @@ pub struct MemoryRow {
     pub created_at: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct DecodedRow {
     pub tag: Option<String>,
     pub text: String,
@@ -37,6 +39,8 @@ pub struct DecodedRow {
     pub file_path: String,
     pub line_start: u32,
     pub session_id: String,
+    pub name: String,
+    pub references: String,
     pub depends_on: String,
     pub status: String,
     pub mtime_secs: u64,
@@ -75,6 +79,8 @@ pub fn memory_schema() -> SchemaRef {
         Field::new("file_path", DataType::Utf8, false),
         Field::new("line_start", DataType::UInt32, false),
         Field::new("session_id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("references", DataType::Utf8, false),
         Field::new("depends_on", DataType::Utf8, false),
         Field::new("status", DataType::Utf8, false),
         Field::new("mtime_secs", DataType::UInt64, false),
@@ -129,6 +135,8 @@ pub fn empty_record_batch(schema: SchemaRef) -> Result<RecordBatch> {
     let file_paths = StringArray::from_iter_values(std::iter::empty::<&str>());
     let line_starts = arrow_array::UInt32Array::from_iter_values(std::iter::empty::<u32>());
     let session_ids = StringArray::from_iter_values(std::iter::empty::<&str>());
+    let names = StringArray::from_iter_values(std::iter::empty::<&str>());
+    let refs = StringArray::from_iter_values(std::iter::empty::<&str>());
     let depends_on_vals = StringArray::from_iter_values(std::iter::empty::<&str>());
     let status_vals = StringArray::from_iter_values(std::iter::empty::<&str>());
     let mtimes = arrow_array::UInt64Array::from_iter_values(std::iter::empty::<u64>());
@@ -145,6 +153,8 @@ pub fn empty_record_batch(schema: SchemaRef) -> Result<RecordBatch> {
             Arc::new(file_paths),
             Arc::new(line_starts),
             Arc::new(session_ids),
+            Arc::new(names),
+            Arc::new(refs),
             Arc::new(depends_on_vals),
             Arc::new(status_vals),
             Arc::new(mtimes),
@@ -183,6 +193,8 @@ pub fn rows_to_batch(schema: SchemaRef, rows: &[MemoryRow]) -> Result<RecordBatc
     let file_paths = StringArray::from_iter_values(rows.iter().map(|r| r.file_path.as_str()));
     let line_starts = arrow_array::UInt32Array::from_iter_values(rows.iter().map(|r| r.line_start));
     let session_ids = StringArray::from_iter_values(rows.iter().map(|r| r.session_id.as_str()));
+    let names = StringArray::from_iter_values(rows.iter().map(|r| r.name.as_str()));
+    let refs = StringArray::from_iter_values(rows.iter().map(|r| r.references.as_str()));
     let depends_on_vals = StringArray::from_iter_values(rows.iter().map(|r| r.depends_on.as_str()));
     let status_vals = StringArray::from_iter_values(rows.iter().map(|r| r.status.as_str()));
     let mtimes = arrow_array::UInt64Array::from_iter_values(rows.iter().map(|r| r.mtime_secs));
@@ -199,6 +211,8 @@ pub fn rows_to_batch(schema: SchemaRef, rows: &[MemoryRow]) -> Result<RecordBatc
             Arc::new(file_paths),
             Arc::new(line_starts),
             Arc::new(session_ids),
+            Arc::new(names),
+            Arc::new(refs),
             Arc::new(depends_on_vals),
             Arc::new(status_vals),
             Arc::new(mtimes),
@@ -221,6 +235,8 @@ pub fn decode_rows(
         let path_col = batch.column_by_name("file_path").context("Missing 'file_path' column")?;
         let line_col = batch.column_by_name("line_start").context("Missing 'line_start' column")?;
         let session_col = batch.column_by_name("session_id").context("Missing 'session_id' column")?;
+        let name_col = batch.column_by_name("name").context("Missing 'name' column")?;
+        let ref_col = batch.column_by_name("references").context("Missing 'references' column")?;
         let dep_col = batch.column_by_name("depends_on").context("Missing 'depends_on' column")?;
         let status_col = batch.column_by_name("status").context("Missing 'status' column")?;
         let mtime_col = batch.column_by_name("mtime_secs").context("Missing 'mtime_secs' column")?;
@@ -233,6 +249,8 @@ pub fn decode_rows(
         let paths = path_col.as_any().downcast_ref::<StringArray>().context("Expected 'file_path' to be Utf8 StringArray")?;
         let lines = line_col.as_any().downcast_ref::<arrow_array::UInt32Array>().context("Expected 'line_start' to be UInt32Array")?;
         let sessions = session_col.as_any().downcast_ref::<StringArray>().context("Expected 'session_id' to be Utf8 StringArray")?;
+        let names = name_col.as_any().downcast_ref::<StringArray>().context("Expected 'name' to be Utf8 StringArray")?;
+        let refs = ref_col.as_any().downcast_ref::<StringArray>().context("Expected 'references' to be Utf8 StringArray")?;
         let deps = dep_col.as_any().downcast_ref::<StringArray>().context("Expected 'depends_on' to be Utf8 StringArray")?;
         let statuses = status_col.as_any().downcast_ref::<StringArray>().context("Expected 'status' to be Utf8 StringArray")?;
         let mtimes = mtime_col.as_any().downcast_ref::<arrow_array::UInt64Array>().context("Expected 'mtime_secs' to be UInt64Array")?;
@@ -246,6 +264,8 @@ pub fn decode_rows(
             let path = if paths.is_null(row) { "unknown".to_string() } else { paths.value(row).to_string() };
             let line = lines.value(row);
             let session = if sessions.is_null(row) { "default".to_string() } else { sessions.value(row).to_string() };
+            let name = if names.is_null(row) { String::new() } else { names.value(row).to_string() };
+            let reference = if refs.is_null(row) { "[]".to_string() } else { refs.value(row).to_string() };
             let dep = if deps.is_null(row) { "[]".to_string() } else { deps.value(row).to_string() };
             let status = if statuses.is_null(row) { "pending".to_string() } else { statuses.value(row).to_string() };
             let mtime = mtimes.value(row);
@@ -259,6 +279,8 @@ pub fn decode_rows(
                 file_path: path,
                 line_start: line,
                 session_id: session,
+                name,
+                references: reference,
                 depends_on: dep,
                 status,
                 mtime_secs: mtime,

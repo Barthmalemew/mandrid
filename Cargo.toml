@@ -27,3 +27,6 @@ lsp-types = "0.95"
 # These are used directly for schema / result decoding.
 arrow-array = "56.2.0"
 arrow-schema = "56.2.0"
+axum = "0.8.8"
+tower-http = { version = "0.6.8", features = ["fs", "cors"] }
+chrono = "0.4.43"

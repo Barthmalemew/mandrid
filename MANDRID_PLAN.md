@@ -19,10 +19,11 @@ Mandrid is a high-performance, local-first AI memory layer designed to outperfor
 - [x] **Role System:** Configurable agent roles (`programmer` vs `assistant`) with enforced constraints.
 - [x] **Task-Aware Context Injection:** `mem context` automatically highlights active goals and dependencies.
 - [x] **Task-Aware Retrieval:** `mem ask --task-aware` boosts results based on the current active task description.
+- [x] **Cross-Encoder Reranking:** Integrated `BGE-Reranker-Base` via FastEmbed for hyper-precision (`mem ask --rerank`).
 
 ## 🚀 Features in Progress
 
-- [ ] **Cross-Encoder Reranking:** A local, CPU-friendly model (e.g., BGE-Reranker) for hyper-precision.
+- [ ] **LSP Hooking:** Integrating with Language Server Protocol to see code changes in real-time.
 
 
 ## 📅 Potential / Future Features

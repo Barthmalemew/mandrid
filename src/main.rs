@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding, TextRerank, RerankerModel, RerankInitOptions};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::index::Index;
@@ -151,6 +151,10 @@ enum Command {
         /// Boost results relevant to the current active task
         #[arg(long)]
         task_aware: bool,
+
+        /// Enable Cross-Encoder Reranking for hyper-precision
+        #[arg(long)]
+        rerank: bool,
     },
 
     /// Inspect the local LanceDB memory store.
@@ -699,6 +703,7 @@ Do not edit `.mem_db/` manually.
             limit,
             vector_only,
             task_aware,
+            rerank,
         } => {
             let mut embedder = init_embedder(cache_dir.clone(), !json_output)?;
             let table = open_table(&db_path).await.with_context(|| {
@@ -723,7 +728,35 @@ Do not edit `.mem_db/` manually.
             }
 
             let query_embedding = embed_prefixed(&mut embedder, "query", &final_query)?;
-            let results = ask_table(&table, &query_embedding, &final_query, limit, vector_only).await?;
+            
+            // If reranking, fetch more candidates initially
+            let fetch_limit = if rerank { limit.max(10) * 2 } else { limit };
+            let mut results = ask_table(&table, &query_embedding, &final_query, fetch_limit, vector_only).await?;
+
+            if rerank && !results.is_empty() {
+                if !json_output {
+                    println!("-- Reranking top {} candidates...", results.len());
+                }
+                let mut reranker = init_reranker(cache_dir.clone(), !json_output)?;
+                let documents: Vec<&str> = results.iter().map(|r| r.text.as_str()).collect();
+                let reranked = reranker.rerank(final_query.as_str(), documents.as_slice(), false, None)?;
+                
+                // Sort results based on reranker scores
+                let mut indexed_results: Vec<_> = results.into_iter().enumerate().collect();
+                indexed_results.sort_by(|(idx_a, _), (idx_b, _)| {
+                    let score_a = reranked.get(*idx_a).map(|r| r.score).unwrap_or(0.0);
+                    let score_b = reranked.get(*idx_b).map(|r| r.score).unwrap_or(0.0);
+                    score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                
+                results = indexed_results.into_iter().map(|(_, r)| r).take(limit).collect();
+                // Update ranks
+                for (idx, r) in results.iter_mut().enumerate() {
+                    r.rank = idx + 1;
+                }
+            } else if rerank {
+                results = results.into_iter().take(limit).collect();
+            }
 
             if json_output {
                 let payload = AskJsonPayload {
@@ -848,6 +881,18 @@ fn init_embedder(cache_dir: Option<PathBuf>, show_progress: bool) -> Result<Text
         .with_show_download_progress(show_progress);
 
     Ok(TextEmbedding::try_new(options)?)
+}
+
+fn init_reranker(cache_dir: Option<PathBuf>, show_progress: bool) -> Result<TextRerank> {
+    let cache_dir = cache_dir
+        .or_else(|| dirs::cache_dir().map(|p| p.join("mandrid")))
+        .unwrap_or_else(|| PathBuf::from("./.mem_cache"));
+
+    let options = RerankInitOptions::new(RerankerModel::BGERerankerBase)
+        .with_cache_dir(cache_dir)
+        .with_show_download_progress(show_progress);
+
+    Ok(TextRerank::try_new(options)?)
 }
 
 fn embed_prefixed(embedder: &mut TextEmbedding, prefix: &str, text: &str) -> Result<Vec<f32>> {

@@ -17,10 +17,13 @@ Mandrid is a high-performance, local-first AI memory layer designed to outperfor
 - [x] **Nix Integration:** Reproducible dev environment.
 - [x] **Beads-inspired Task Engine (`mem task`):** Dependency-aware task graph management.
 - [x] **Role System:** Configurable agent roles (`programmer` vs `assistant`) with enforced constraints.
+- [x] **Task-Aware Context Injection:** `mem context` automatically highlights active goals and dependencies.
+- [x] **Task-Aware Retrieval:** `mem ask --task-aware` boosts results based on the current active task description.
 
 ## 🚀 Features in Progress
 
-- [ ] **Task-Aware Retrieval:** Prioritizing memories based on the current active task.
+- [ ] **Cross-Encoder Reranking:** A local, CPU-friendly model (e.g., BGE-Reranker) for hyper-precision.
+
 
 ## 📅 Potential / Future Features
 

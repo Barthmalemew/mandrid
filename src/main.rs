@@ -147,6 +147,10 @@ enum Command {
         /// Disable Hybrid Search (use vector only)
         #[arg(long)]
         vector_only: bool,
+
+        /// Boost results relevant to the current active task
+        #[arg(long)]
+        task_aware: bool,
     },
 
     /// Inspect the local LanceDB memory store.
@@ -349,6 +353,11 @@ async fn main() -> Result<()> {
             let config_rows = decode_rows(&config_batches, None)?;
             let role = config_rows.first().map(|r| r.text.as_str()).unwrap_or("programmer");
 
+            // 2. Get Active Task(s) for awareness
+            let task_stream = table.query().only_if("memory_type = 'task' AND status = 'active'").execute().await?;
+            let task_batches: Vec<RecordBatch> = task_stream.try_collect().await?;
+            let active_tasks = decode_rows(&task_batches, None)?;
+
             let filter = format!("session_id = '{}' OR memory_type = 'manual' OR memory_type = 'task'", session_id.replace('\'', "''"));
 
             let stream = table
@@ -366,9 +375,26 @@ async fn main() -> Result<()> {
             if role == "assistant" {
                 println!("## CONSTRAINT: You are NOT allowed to write or modify code files directly. You must only provide guidance and snippets in chat.");
             }
-            println!("## Active Session: {}", session_id);
+            
+            if !active_tasks.is_empty() {
+                println!("\n## CURRENT GOAL (Active Tasks)");
+                for task in &active_tasks {
+                    let name = task.tag.as_ref().unwrap_or(&"unknown".to_string()).replace("task:", "");
+                    println!("- **{}**: {}", name, task.text);
+                    if task.depends_on != "[]" {
+                        println!("  - Depends on: {}", task.depends_on);
+                    }
+                }
+            }
+
+            println!("\n## Active Session: {}", session_id);
             
             for row in rows {
+                // Don't repeat active tasks if they are already shown above
+                if row.memory_type == "task" && row.status == "active" {
+                    continue;
+                }
+                
                 println!("\n## {} ({}) [Session: {}]", row.tag.unwrap_or_else(|| "unknown".to_string()), row.memory_type, row.session_id);
                 if row.memory_type == "code" {
                     println!("File: {}:{}", row.file_path, row.line_start);
@@ -672,6 +698,7 @@ Do not edit `.mem_db/` manually.
             json_output,
             limit,
             vector_only,
+            task_aware,
         } => {
             let mut embedder = init_embedder(cache_dir.clone(), !json_output)?;
             let table = open_table(&db_path).await.with_context(|| {
@@ -681,8 +708,22 @@ Do not edit `.mem_db/` manually.
                 )
             })?;
 
-            let query_embedding = embed_prefixed(&mut embedder, "query", &question)?;
-            let results = ask_table(&table, &query_embedding, &question, limit, vector_only).await?;
+            let mut final_query = question.clone();
+            if task_aware {
+                let task_stream = table.query().only_if("memory_type = 'task' AND status = 'active'").execute().await?;
+                let task_batches: Vec<RecordBatch> = task_stream.try_collect().await?;
+                let active_tasks = decode_rows(&task_batches, None)?;
+                
+                if let Some(task) = active_tasks.first() {
+                    if !json_output {
+                        println!("-- Focusing on Active Task: {}", task.tag.as_ref().unwrap().replace("task:", ""));
+                    }
+                    final_query = format!("Task Context: {} \nQuery: {}", task.text, question);
+                }
+            }
+
+            let query_embedding = embed_prefixed(&mut embedder, "query", &final_query)?;
+            let results = ask_table(&table, &query_embedding, &final_query, limit, vector_only).await?;
 
             if json_output {
                 let payload = AskJsonPayload {

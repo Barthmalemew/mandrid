@@ -24,6 +24,28 @@ const DEFAULT_DB_PATH: &str = "./.mem_db";
 const DEFAULT_TABLE_NAME: &str = "memories";
 const EMBEDDING_DIMS: i32 = 384;
 
+#[derive(Subcommand, Debug)]
+enum TaskCommand {
+    /// Create a new task.
+    Create {
+        name: String,
+        description: String,
+        /// Optional parent task names
+        #[arg(long)]
+        depends_on: Vec<String>,
+    },
+    /// List all tasks and their status.
+    List,
+    /// Mark a task as active/started.
+    Start {
+        name: String,
+    },
+    /// Mark a task as completed.
+    Finish {
+        name: String,
+    },
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "mem", version, about = "Mandrid (mem) - local persistent memory")]
 struct Cli {
@@ -84,8 +106,19 @@ enum Command {
         limit: usize,
     },
 
+    /// Manage high-level development tasks (inspired by Beads).
+    Task {
+        #[command(subcommand)]
+        subcommand: TaskCommand,
+    },
+
     /// Initialize Mandrid in the current directory (setup DB, gitignore, docs).
-    Init,
+    Init {
+        /// Role of the AI agent (programmer or assistant)
+        #[arg(long, default_value = "programmer")]
+        role: String,
+    },
+
 
     /// Ingest a single code file, chop it up, and save it.
     Digest {
@@ -152,6 +185,8 @@ struct MemoryRow {
     file_path: String,
     line_start: u32,
     session_id: String,
+    depends_on: String, // JSON list
+    status: String,     // "pending", "active", "completed"
     mtime_secs: u64,
     size_bytes: u64,
     created_at: u64,
@@ -180,6 +215,8 @@ async fn main() -> Result<()> {
                 file_path: "manual".to_string(),
                 line_start: 0,
                 session_id: session.unwrap_or_else(|| "default".to_string()),
+                depends_on: "[]".to_string(),
+                status: "n/a".to_string(),
                 mtime_secs: 0,
                 size_bytes: 0,
                 created_at: now,
@@ -203,6 +240,8 @@ async fn main() -> Result<()> {
                 file_path: "interaction".to_string(),
                 line_start: 0,
                 session_id: session.unwrap_or_else(|| "default".to_string()),
+                depends_on: "[]".to_string(),
+                status: "n/a".to_string(),
                 mtime_secs: 0,
                 size_bytes: 0,
                 created_at: now,
@@ -234,6 +273,8 @@ async fn main() -> Result<()> {
                 file_path: "git".to_string(),
                 line_start: 0,
                 session_id: session.unwrap_or_else(|| "default".to_string()),
+                depends_on: "[]".to_string(),
+                status: "n/a".to_string(),
                 mtime_secs: 0,
                 size_bytes: 0,
                 created_at: now,
@@ -301,7 +342,14 @@ async fn main() -> Result<()> {
             })?;
 
             let session_id = session.unwrap_or_else(|| "default".to_string());
-            let filter = format!("session_id = '{}' OR memory_type = 'manual'", session_id.replace('\'', "''"));
+            
+            // 1. Get Project Role/Config
+            let config_stream = table.query().only_if("memory_type = 'system_config'").execute().await?;
+            let config_batches: Vec<RecordBatch> = config_stream.try_collect().await?;
+            let config_rows = decode_rows(&config_batches, None)?;
+            let role = config_rows.first().map(|r| r.text.as_str()).unwrap_or("programmer");
+
+            let filter = format!("session_id = '{}' OR memory_type = 'manual' OR memory_type = 'task'", session_id.replace('\'', "''"));
 
             let stream = table
                 .query()
@@ -314,17 +362,25 @@ async fn main() -> Result<()> {
             let rows = decode_rows(&batches, None)?;
 
             println!("<project_context>");
+            println!("## AI Agent Role: {}", role.to_uppercase());
+            if role == "assistant" {
+                println!("## CONSTRAINT: You are NOT allowed to write or modify code files directly. You must only provide guidance and snippets in chat.");
+            }
             println!("## Active Session: {}", session_id);
+            
             for row in rows {
                 println!("\n## {} ({}) [Session: {}]", row.tag.unwrap_or_else(|| "unknown".to_string()), row.memory_type, row.session_id);
                 if row.memory_type == "code" {
                     println!("File: {}:{}", row.file_path, row.line_start);
                 }
+                if row.memory_type == "task" {
+                    println!("Status: {} | Dependencies: {}", row.status, row.depends_on);
+                }
                 println!("{}", row.text);
             }
             println!("</project_context>");
         }
-        Command::Init => {
+        Command::Init { role } => {
             // 1. Create DB Directory
             if !db_path.exists() {
                 fs::create_dir_all(&db_path).context("Failed to create .mem_db")?;
@@ -333,7 +389,30 @@ async fn main() -> Result<()> {
                 println!("Memory database already exists at {}", db_path.display());
             }
 
-            // 2. Add to .gitignore
+            let table = open_or_create_table(&db_path).await?;
+            
+            // 2. Save Project Role
+            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+            let role_row = MemoryRow {
+                vector: vec![0.0; EMBEDDING_DIMS as usize], // System configs don't need real embeddings
+                text: role.clone(),
+                tag: "system:role".to_string(),
+                memory_type: "system_config".to_string(),
+                file_path: "config".to_string(),
+                line_start: 0,
+                session_id: "global".to_string(),
+                depends_on: "[]".to_string(),
+                status: "active".to_string(),
+                mtime_secs: 0,
+                size_bytes: 0,
+                created_at: now,
+            };
+            
+            // Delete old role if exists
+            let _ = table.delete("memory_type = 'system_config'").await;
+            add_rows(&table, vec![role_row]).await?;
+
+            // 3. Add to .gitignore
             let gitignore_path = Path::new(".gitignore");
             let mem_ignore = ".mem_db/";
             let mut current_ignore = if gitignore_path.exists() {
@@ -352,28 +431,132 @@ async fn main() -> Result<()> {
                 println!("Added .mem_db/ to .gitignore");
             }
 
-            // 3. Create AGENTS.md
+            // 4. Create AGENTS.md
             let agents_md_path = Path::new("AGENTS.md");
             if !agents_md_path.exists() {
-                let agents_content = r#"# Mandrid Memory Agent Instructions
+                let agents_content = format!(r#"# Mandrid Memory Agent Instructions
 
 This project uses **Mandrid** (`mem`) to store context and reasoning.
-Before starting tasks, please verify the memory state.
+Your current role is defined as: **{}**
 
 ## Quick Start
-1. **Check Context:** Run `mem brief` to see recent decisions and reasoning.
-2. **Search:** Run `mem ask --json "query"` to find relevant code or patterns.
-3. **Capture:** When completing a significant task, run:
-   `mem capture "Reasoning: why I did this change"`
+1. **Check Context:** Run `mem context` to see your role, current session, and recent work.
+2. **Search:** Run `mem ask "query"` to find relevant code or patterns.
+3. **Capture:** When completing a task, run: `mem capture "Reasoning: why I did this change"`
 
 ## Tools
-- `mem learn`: Re-indexes the codebase (run this if you suspect the index is stale).
-- `mem capture`: Saves your git diff + reasoning to the permanent record.
+- `mem learn`: Re-indexes the codebase.
+- `mem task`: Manage development goals and dependencies.
+- `mem map`: Visualize project architecture.
 
 Do not edit `.mem_db/` manually.
-"#;
+"#, role);
                 fs::write(agents_md_path, agents_content)?;
                 println!("Created AGENTS.md");
+            }
+        }
+        Command::Task { subcommand } => {
+            let table = open_or_create_table(&db_path).await?;
+            let mut embedder = init_embedder(cache_dir.clone(), true)?;
+            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+
+            match subcommand {
+                TaskCommand::Create { name, description, depends_on } => {
+                    let deps_json = serde_json::to_string(&depends_on)?;
+                    let row = MemoryRow {
+                        vector: embed_prefixed(&mut embedder, "task", &description)?,
+                        text: description,
+                        tag: format!("task:{}", name),
+                        memory_type: "task".to_string(),
+                        file_path: "task".to_string(),
+                        line_start: 0,
+                        session_id: "global".to_string(),
+                        depends_on: deps_json,
+                        status: "pending".to_string(),
+                        mtime_secs: 0,
+                        size_bytes: 0,
+                        created_at: now,
+                    };
+                    add_rows(&table, vec![row]).await?;
+                    println!("Task '{}' created.", name);
+                }
+                TaskCommand::List => {
+                    let stream = table.query().only_if("memory_type = 'task'").execute().await?;
+                    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                    let rows = decode_rows(&batches, None)?;
+                    
+                    println!("=== DEVELOPMENT TASKS ===");
+                    for row in rows {
+                        let name = row.tag.unwrap_or_default().replace("task:", "");
+                        println!("\n[{}] {}", row.status.to_uppercase(), name);
+                        println!("Description: {}", row.text);
+                        if row.depends_on != "[]" {
+                            println!("Depends on: {}", row.depends_on);
+                        }
+                    }
+                }
+                TaskCommand::Start { name } => {
+                    let predicate = format!("tag = 'task:{}'", name.replace('\'', "''"));
+                    // In a real impl, we'd update the row. LanceDB update is a bit complex (merge_insert).
+                    // For a prototype, let's delete and re-add with new status.
+                    let stream = table.query().only_if(&predicate).execute().await?;
+                    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                    let rows = decode_rows(&batches, None)?;
+                    
+                    if let Some(row) = rows.first() {
+                        let mut new_row = MemoryRow {
+                            vector: vec![0.0; EMBEDDING_DIMS as usize], // placeholder, ideally re-embed or keep
+                            text: row.text.clone(),
+                            tag: row.tag.clone().unwrap(),
+                            memory_type: "task".to_string(),
+                            file_path: row.file_path.clone(),
+                            line_start: row.line_start,
+                            session_id: row.session_id.clone(),
+                            depends_on: row.depends_on.clone(),
+                            status: "active".to_string(),
+                            mtime_secs: 0,
+                            size_bytes: 0,
+                            created_at: now,
+                        };
+                        new_row.vector = embed_prefixed(&mut embedder, "task", &new_row.text)?;
+                        
+                        table.delete(&predicate).await?;
+                        add_rows(&table, vec![new_row]).await?;
+                        println!("Task '{}' started.", name);
+                    } else {
+                        println!("Task '{}' not found.", name);
+                    }
+                }
+                TaskCommand::Finish { name } => {
+                    let predicate = format!("tag = 'task:{}'", name.replace('\'', "''"));
+                    let stream = table.query().only_if(&predicate).execute().await?;
+                    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                    let rows = decode_rows(&batches, None)?;
+                    
+                    if let Some(row) = rows.first() {
+                        let mut new_row = MemoryRow {
+                            vector: vec![0.0; EMBEDDING_DIMS as usize],
+                            text: row.text.clone(),
+                            tag: row.tag.clone().unwrap(),
+                            memory_type: "task".to_string(),
+                            file_path: row.file_path.clone(),
+                            line_start: row.line_start,
+                            session_id: row.session_id.clone(),
+                            depends_on: row.depends_on.clone(),
+                            status: "completed".to_string(),
+                            mtime_secs: 0,
+                            size_bytes: 0,
+                            created_at: now,
+                        };
+                        new_row.vector = embed_prefixed(&mut embedder, "task", &new_row.text)?;
+                        
+                        table.delete(&predicate).await?;
+                        add_rows(&table, vec![new_row]).await?;
+                        println!("Task '{}' finished.", name);
+                    } else {
+                        println!("Task '{}' not found.", name);
+                    }
+                }
             }
         }
         Command::Digest { ref file_path } => {
@@ -651,11 +834,14 @@ fn memory_schema() -> SchemaRef {
         Field::new("file_path", DataType::Utf8, false),
         Field::new("line_start", DataType::UInt32, false),
         Field::new("session_id", DataType::Utf8, false),
+        Field::new("depends_on", DataType::Utf8, false),
+        Field::new("status", DataType::Utf8, false),
         Field::new("mtime_secs", DataType::UInt64, false),
         Field::new("size_bytes", DataType::UInt64, false),
         Field::new("created_at", DataType::UInt64, false),
     ]))
 }
+
 
 async fn open_or_create_table(db_path: &Path) -> Result<lancedb::Table> {
     let db = lancedb::connect(db_path.to_str().context("Invalid db path")?)
@@ -706,6 +892,8 @@ fn empty_record_batch(schema: SchemaRef) -> Result<RecordBatch> {
     let file_paths = StringArray::from_iter_values(std::iter::empty::<&str>());
     let line_starts = arrow_array::UInt32Array::from_iter_values(std::iter::empty::<u32>());
     let session_ids = StringArray::from_iter_values(std::iter::empty::<&str>());
+    let depends_on_vals = StringArray::from_iter_values(std::iter::empty::<&str>());
+    let status_vals = StringArray::from_iter_values(std::iter::empty::<&str>());
     let mtimes = arrow_array::UInt64Array::from_iter_values(std::iter::empty::<u64>());
     let sizes = arrow_array::UInt64Array::from_iter_values(std::iter::empty::<u64>());
     let created_ats = arrow_array::UInt64Array::from_iter_values(std::iter::empty::<u64>());
@@ -720,6 +908,8 @@ fn empty_record_batch(schema: SchemaRef) -> Result<RecordBatch> {
             Arc::new(file_paths),
             Arc::new(line_starts),
             Arc::new(session_ids),
+            Arc::new(depends_on_vals),
+            Arc::new(status_vals),
             Arc::new(mtimes),
             Arc::new(sizes),
             Arc::new(created_ats),
@@ -756,6 +946,8 @@ fn rows_to_batch(schema: SchemaRef, rows: &[MemoryRow]) -> Result<RecordBatch> {
     let file_paths = StringArray::from_iter_values(rows.iter().map(|r| r.file_path.as_str()));
     let line_starts = arrow_array::UInt32Array::from_iter_values(rows.iter().map(|r| r.line_start));
     let session_ids = StringArray::from_iter_values(rows.iter().map(|r| r.session_id.as_str()));
+    let depends_on_vals = StringArray::from_iter_values(rows.iter().map(|r| r.depends_on.as_str()));
+    let status_vals = StringArray::from_iter_values(rows.iter().map(|r| r.status.as_str()));
     let mtimes = arrow_array::UInt64Array::from_iter_values(rows.iter().map(|r| r.mtime_secs));
     let sizes = arrow_array::UInt64Array::from_iter_values(rows.iter().map(|r| r.size_bytes));
     let created_ats = arrow_array::UInt64Array::from_iter_values(rows.iter().map(|r| r.created_at));
@@ -770,6 +962,8 @@ fn rows_to_batch(schema: SchemaRef, rows: &[MemoryRow]) -> Result<RecordBatch> {
             Arc::new(file_paths),
             Arc::new(line_starts),
             Arc::new(session_ids),
+            Arc::new(depends_on_vals),
+            Arc::new(status_vals),
             Arc::new(mtimes),
             Arc::new(sizes),
             Arc::new(created_ats),
@@ -914,6 +1108,8 @@ fn digest_file(embedder: &mut TextEmbedding, file_path: &Path) -> Result<Vec<Mem
             file_path: abs_path.display().to_string(),
             line_start,
             session_id: "global".to_string(),
+            depends_on: "[]".to_string(),
+            status: "n/a".to_string(),
             mtime_secs,
             size_bytes,
             created_at: now,
@@ -986,6 +1182,8 @@ struct DecodedRow {
     file_path: String,
     line_start: u32,
     session_id: String,
+    depends_on: String,
+    status: String,
     mtime_secs: u64,
     size_bytes: u64,
     created_at: u64,
@@ -1004,6 +1202,8 @@ fn decode_rows(
         let path_col = batch.column_by_name("file_path").context("Missing 'file_path' column")?;
         let line_col = batch.column_by_name("line_start").context("Missing 'line_start' column")?;
         let session_col = batch.column_by_name("session_id").context("Missing 'session_id' column")?;
+        let dep_col = batch.column_by_name("depends_on").context("Missing 'depends_on' column")?;
+        let status_col = batch.column_by_name("status").context("Missing 'status' column")?;
         let mtime_col = batch.column_by_name("mtime_secs").context("Missing 'mtime_secs' column")?;
         let size_col = batch.column_by_name("size_bytes").context("Missing 'size_bytes' column")?;
         let time_col = batch.column_by_name("created_at").context("Missing 'created_at' column")?;
@@ -1014,6 +1214,8 @@ fn decode_rows(
         let paths = path_col.as_any().downcast_ref::<StringArray>().context("Expected 'file_path' to be Utf8 StringArray")?;
         let lines = line_col.as_any().downcast_ref::<arrow_array::UInt32Array>().context("Expected 'line_start' to be UInt32Array")?;
         let sessions = session_col.as_any().downcast_ref::<StringArray>().context("Expected 'session_id' to be Utf8 StringArray")?;
+        let deps = dep_col.as_any().downcast_ref::<StringArray>().context("Expected 'depends_on' to be Utf8 StringArray")?;
+        let statuses = status_col.as_any().downcast_ref::<StringArray>().context("Expected 'status' to be Utf8 StringArray")?;
         let mtimes = mtime_col.as_any().downcast_ref::<arrow_array::UInt64Array>().context("Expected 'mtime_secs' to be UInt64Array")?;
         let sizes = size_col.as_any().downcast_ref::<arrow_array::UInt64Array>().context("Expected 'size_bytes' to be UInt64Array")?;
         let times = time_col.as_any().downcast_ref::<arrow_array::UInt64Array>().context("Expected 'created_at' to be UInt64Array")?;
@@ -1025,6 +1227,8 @@ fn decode_rows(
             let path = if paths.is_null(row) { "unknown".to_string() } else { paths.value(row).to_string() };
             let line = lines.value(row);
             let session = if sessions.is_null(row) { "default".to_string() } else { sessions.value(row).to_string() };
+            let dep = if deps.is_null(row) { "[]".to_string() } else { deps.value(row).to_string() };
+            let status = if statuses.is_null(row) { "pending".to_string() } else { statuses.value(row).to_string() };
             let mtime = mtimes.value(row);
             let size = sizes.value(row);
             let created_at = times.value(row);
@@ -1036,6 +1240,8 @@ fn decode_rows(
                 file_path: path,
                 line_start: line,
                 session_id: session,
+                depends_on: dep,
+                status,
                 mtime_secs: mtime,
                 size_bytes: size,
                 created_at,

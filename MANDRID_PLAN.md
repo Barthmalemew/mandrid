@@ -12,7 +12,7 @@ Mandrid is a high-performance, local-first AI memory layer designed to outperfor
 - [x] **RRF Reranking:** Reciprocal Rank Fusion to balance vector and keyword results.
 - [x] **Consolidated State:** Killed `index_state.json`. File metadata now lives in the DB.
 - [x] **Session Engine:** Isolated context via `session_id`.
-- [x] **Project Briefing (`mem brief`):** Summarizes recent decisions and key patterns.
+- [x] **Project Briefing:** Integrated into `mem context --human`.
 - [x] **Architecture Map (`mem map`):** Provides a high-level symbol map of the codebase.
 - [x] **Nix Integration:** Reproducible dev environment.
 - [x] **Beads-inspired Task Engine (`mem task`):** Dependency-aware task graph management.
@@ -22,6 +22,7 @@ Mandrid is a high-performance, local-first AI memory layer designed to outperfor
 - [x] **Cross-Encoder Reranking:** Integrated `BGE-Reranker-Base` via FastEmbed for hyper-precision (`mem ask --rerank`).
 - [x] **Filesystem Watcher (`mem watch`):** Automatically re-indexes files on save.
 - [x] **LSP Sidecar (`mem lsp`):** A minimal LSP server that receives real-time code changes from your editor (even unsaved buffers).
+- [x] **Modular Architecture:** Refactored into `db`, `chunker`, and `task` modules for scalability.
 
 ## 🚀 Features in Progress
 

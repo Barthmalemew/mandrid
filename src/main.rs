@@ -39,13 +39,26 @@ use crate::chunker::*;
 use crate::db::*;
 use crate::task::*;
 
-const DEFAULT_DB_PATH: &str = "./.mem_db";
+const DEFAULT_DB_DIR: &str = ".mem_db";
+
+fn find_project_root() -> Option<PathBuf> {
+    let mut curr = std::env::current_dir().ok()?;
+    loop {
+        if curr.join(".git").exists() || curr.join(DEFAULT_DB_DIR).exists() {
+            return Some(curr);
+        }
+        if !curr.pop() {
+            break;
+        }
+    }
+    None
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "mem", version, about = "Mandrid (mem) - local persistent memory")]
 struct Cli {
-    #[arg(long, env = "MEM_DB_PATH", default_value = DEFAULT_DB_PATH)]
-    db_path: PathBuf,
+    #[arg(long, env = "MEM_DB_PATH")]
+    db_path: Option<PathBuf>,
 
     #[arg(long, env = "MEM_CACHE_DIR")]
     cache_dir: Option<PathBuf>,
@@ -76,6 +89,13 @@ enum Command {
         session: Option<String>,
     },
 
+    /// Record a reasoning trace or strategic plan.
+    Think {
+        text: String,
+        #[arg(long)]
+        session: Option<String>,
+    },
+
     /// Capture current context (git diff + reasoning) into memory.
     Capture {
         /// The reasoning or explanation for the current state/changes
@@ -99,13 +119,6 @@ enum Command {
         /// Output in machine-readable JSON format
         #[arg(long)]
         json: bool,
-    },
-
-    /// Record a reasoning trace or strategic plan.
-    Think {
-        text: String,
-        #[arg(long)]
-        session: Option<String>,
     },
 
     /// Compress old episodic memories to reduce noise.
@@ -251,7 +264,9 @@ struct AskJsonPayload {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let db_path = cli.db_path.clone();
+    
+    let project_root = find_project_root().unwrap_or_else(|| std::env::current_dir().unwrap());
+    let db_path = cli.db_path.unwrap_or_else(|| project_root.join(DEFAULT_DB_DIR));
     let cache_dir = cli.cache_dir.clone();
 
     match cli.command {
@@ -401,13 +416,15 @@ async fn main() -> Result<()> {
             let mut embedder = init_embedder(cache_dir.clone(), true)?;
             let table = open_or_create_table(&db_path).await?;
 
-            let diff = std::process::Command::new("git")
+            let output = tokio::process::Command::new("git")
                 .args(["diff", "HEAD"])
+                .current_dir(&project_root)
                 .output()
+                .await
                 .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
                 .unwrap_or_else(|_| "No git diff available".to_string());
 
-            let full_text = format!("Reasoning: {}\n\nChanges:\n{}", reasoning, diff);
+            let full_text = format!("Reasoning: {}\n\nChanges:\n{}", reasoning, output);
             let embedding = embed_prefixed(&mut embedder, "passage", &full_text)?;
             let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
 
@@ -462,7 +479,8 @@ async fn main() -> Result<()> {
             
             if let Some(f) = file {
                 let abs_path = fs::canonicalize(&f).unwrap_or(f);
-                filter.push_str(&format!(" AND (file_path = '{}' OR memory_type = 'manual' OR memory_type = 'task' OR memory_type = 'thought')", abs_path.display().to_string().replace('\'', "''")));
+                let rel_path = abs_path.strip_prefix(&project_root).unwrap_or(&abs_path);
+                filter.push_str(&format!(" AND (file_path = '{}' OR memory_type = 'manual' OR memory_type = 'task' OR memory_type = 'thought')", rel_path.display().to_string().replace('\'', "''")));
             }
 
             let stream = table.query().only_if(filter).limit(limit).execute().await?;
@@ -593,7 +611,11 @@ Run `mem context` to start.
         Command::Digest { file_path } => {
             let mut embedder = init_embedder(cache_dir.clone(), true)?;
             let table = open_or_create_table(&db_path).await?;
-            let rows = digest_file_logic(&mut embedder, &file_path)?;
+            
+            let abs_path = fs::canonicalize(&file_path).unwrap_or(file_path.clone());
+            let rel_path = abs_path.strip_prefix(&project_root).unwrap_or(&abs_path);
+            
+            let rows = digest_file_logic(&mut embedder, &abs_path, rel_path)?;
             add_rows(&table, rows).await?;
             println!("Digested {}", file_path.display());
         }
@@ -609,19 +631,21 @@ Run `mem context` to start.
             }
 
             let mut files_to_process = Vec::new();
-            for result in WalkBuilder::new(&root_dir).build() {
+            for result in WalkBuilder::new(&root_dir).hidden(false).git_ignore(true).build() {
                 let entry = result?;
                 let path = entry.path().to_path_buf();
                 if entry.file_type().map(|t| t.is_file()).unwrap_or(false) && is_supported_file(&path) {
                     let metadata = fs::metadata(&path)?;
                     let mtime = metadata.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
                     let size = metadata.len();
+                    
                     let abs_path = fs::canonicalize(&path).unwrap_or(path.clone());
+                    let rel_path = abs_path.strip_prefix(&project_root).unwrap_or(&abs_path).to_path_buf();
 
-                    if let Some(&(db_mtime, db_size)) = db_file_map.get(&abs_path) {
+                    if let Some(&(db_mtime, db_size)) = db_file_map.get(&rel_path) {
                         if db_mtime == mtime && db_size == size { continue; }
                     }
-                    files_to_process.push(abs_path);
+                    files_to_process.push((abs_path, rel_path));
                 }
             }
 
@@ -629,19 +653,20 @@ Run `mem context` to start.
             let mut processed = 0;
             for chunk in files_to_process.chunks(concurrency) {
                 let mut tasks = Vec::new();
-                for file in chunk {
-                    let file = file.clone();
+                for (abs_file, rel_file) in chunk {
+                    let abs_file = abs_file.clone();
+                    let rel_file = rel_file.clone();
                     let c_dir = cache_dir.clone();
                     tasks.push(tokio::spawn(async move {
                         let mut embedder = init_embedder(c_dir, false)?;
-                        digest_file_logic(&mut embedder, &file)
+                        digest_file_logic(&mut embedder, &abs_file, &rel_file)
                     }));
                 }
                 for task in tasks {
                     if let Ok(Ok(rows)) = task.await {
                         if !rows.is_empty() {
-                            let abs_path = PathBuf::from(&rows[0].file_path);
-                            let tag = format!("code:{}", abs_path.display());
+                            let rel_path = &rows[0].file_path;
+                            let tag = format!("code:{}", rel_path);
                             let _ = table.delete(format!("tag = '{}'", tag.replace('\'', "''")).as_str()).await;
                             add_rows(&table, rows).await?;
                             processed += 1;
@@ -850,9 +875,11 @@ Run `mem context` to start.
         Command::SyncGit { commits } => {
             let table = open_or_create_table(&db_path).await?;
             let mut embedder = init_embedder(cache_dir.clone(), true)?;
-            let output = std::process::Command::new("git")
+            let output = tokio::process::Command::new("git")
                 .args(["log", "-p", &format!("-n{}", commits)])
-                .output()?;
+                .current_dir(&project_root)
+                .output()
+                .await?;
             let log = String::from_utf8_lossy(&output.stdout);
             
             for commit_block in log.split("commit ").skip(1) {
@@ -957,9 +984,11 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
                 if let Ok(event) = res {
                     for path in event.paths {
                         if is_supported_file(&path) {
-                            if let Ok(rows) = digest_file_logic(&mut embedder, &path) {
-                                let abs_path = fs::canonicalize(&path).unwrap_or(path.clone());
-                                let _ = table.delete(format!("tag = 'code:{}'", abs_path.display().to_string().replace('\'', "''")).as_str()).await;
+                            let abs_path = fs::canonicalize(&path).unwrap_or(path.clone());
+                            let rel_path = abs_path.strip_prefix(&project_root).unwrap_or(&abs_path);
+                            if let Ok(rows) = digest_file_logic(&mut embedder, &abs_path, rel_path) {
+                                let tag = format!("code:{}", rel_path.display());
+                                let _ = table.delete(format!("tag = '{}'", tag.replace('\'', "''")).as_str()).await;
                                 let _ = add_rows(&table, rows).await;
                                 eprintln!("Updated {}", path.display());
                             }
@@ -986,9 +1015,11 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
                         let params: lsp_types::DidChangeTextDocumentParams = serde_json::from_value(not.params)?;
                         if let Ok(path) = params.text_document.uri.to_file_path() {
                             if let Some(change) = params.content_changes.first() {
-                                if let Ok(rows) = digest_file_content_logic(&mut embedder, &change.text, &path) {
-                                    let abs_path = fs::canonicalize(&path).unwrap_or(path.clone());
-                                    let _ = table.delete(format!("tag = 'code:{}'", abs_path.display().to_string().replace('\'', "''")).as_str()).await;
+                                let abs_path = fs::canonicalize(&path).unwrap_or(path.clone());
+                                let rel_path = abs_path.strip_prefix(&project_root).unwrap_or(&abs_path);
+                                if let Ok(rows) = digest_file_content_logic(&mut embedder, &change.text, &abs_path, rel_path) {
+                                    let tag = format!("code:{}", rel_path.display());
+                                    let _ = table.delete(format!("tag = '{}'", tag.replace('\'', "''")).as_str()).await;
                                     let _ = add_rows(&table, rows).await;
                                 }
                             }
@@ -1008,9 +1039,11 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
             println!("🚀 Mandrid running: {}", full_command);
 
             let start_time = SystemTime::now();
-            let output = std::process::Command::new(&command[0])
+            let output = tokio::process::Command::new(&command[0])
                 .args(&command[1..])
-                .output()?;
+                .current_dir(&project_root)
+                .output()
+                .await?;
             let end_time = SystemTime::now();
             let duration = end_time.duration_since(start_time).unwrap_or_default();
 
@@ -1063,24 +1096,24 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
 }
 
 // Logic wrappers to bridge modules
-fn digest_file_logic(embedder: &mut TextEmbedding, path: &Path) -> Result<Vec<MemoryRow>> {
-    let content = fs::read_to_string(path)?;
-    digest_file_content_logic(embedder, &content, path)
+fn digest_file_logic(embedder: &mut TextEmbedding, abs_path: &Path, rel_path: &Path) -> Result<Vec<MemoryRow>> {
+    let content = fs::read_to_string(abs_path)?;
+    digest_file_content_logic(embedder, &content, abs_path, rel_path)
 }
 
-fn digest_file_content_logic(embedder: &mut TextEmbedding, content: &str, path: &Path) -> Result<Vec<MemoryRow>> {
-    let chunks = structural_chunk(content, path);
+fn digest_file_content_logic(embedder: &mut TextEmbedding, content: &str, abs_path: &Path, rel_path: &Path) -> Result<Vec<MemoryRow>> {
+    let chunks = structural_chunk(content, abs_path);
     let docs: Vec<String> = chunks.iter().map(|c| format!("passage: {}", c.text)).collect();
     let refs_to_embed: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
     let embeddings = embedder.embed(refs_to_embed, None)?;
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
-    let metadata = fs::metadata(path)?;
+    let metadata = fs::metadata(abs_path)?;
     Ok(chunks.into_iter().zip(embeddings.into_iter()).map(|(chunk, vector)| MemoryRow {
         vector,
         text: chunk.text,
-        tag: format!("code:{}", path.display()),
+        tag: format!("code:{}", rel_path.display()),
         memory_type: "code".to_string(),
-        file_path: path.display().to_string(),
+        file_path: rel_path.display().to_string(),
         line_start: chunk.line,
         session_id: "global".to_string(),
         name: chunk.name,

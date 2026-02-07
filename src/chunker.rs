@@ -98,10 +98,27 @@ pub trait LanguageParser {
         let mut reached_root = false;
         while !reached_root {
             let sub_node = cursor.node();
-            if sub_node.kind() == "call_expression" || sub_node.kind() == "call" {
-                if let Some(fn_node) = sub_node.child_by_field_name("function") {
-                    refs.push(content[fn_node.start_byte()..fn_node.end_byte()].to_string());
+            
+            // Handle different call/reference structures
+            match sub_node.kind() {
+                "call_expression" | "call" => {
+                    // Try to extract the function name or member expression
+                    if let Some(fn_node) = sub_node.child_by_field_name("function") {
+                        let raw = &content[fn_node.start_byte()..fn_node.end_byte()];
+                        // If it's a member expression like obj.save(), we might want both 'save' and the full path
+                        if fn_node.kind() == "field_expression" || fn_node.kind() == "member_expression" || fn_node.kind() == "attribute" {
+                            // Extract just the method name for better impact matching
+                            if let Some(prop) = fn_node.child_by_field_name("field").or_else(|| fn_node.child_by_field_name("property")).or_else(|| fn_node.child_by_field_name("attribute")) {
+                                refs.push(content[prop.start_byte()..prop.end_byte()].to_string());
+                            }
+                        }
+                        refs.push(raw.to_string());
+                    }
+                },
+                "import_from_statement" | "import_statement" | "use_declaration" => {
+                    // Basic extraction of imported names could go here
                 }
+                _ => {}
             }
 
             if cursor.goto_first_child() {
@@ -114,6 +131,8 @@ pub trait LanguageParser {
                 }
             }
         }
+        refs.sort();
+        refs.dedup();
         refs
     }
 }
@@ -178,6 +197,52 @@ impl LanguageParser for JavaScriptParser {
     }
 }
 
+pub struct TypeScriptParser;
+impl LanguageParser for TypeScriptParser {
+    fn language(&self) -> Language { tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into() }
+    fn query_source(&self) -> &'static str {
+        r#"
+        (function_declaration name: (identifier) @name) @symbol
+        (class_declaration name: (type_identifier) @name) @symbol
+        (method_definition name: (property_identifier) @name) @symbol
+        (interface_declaration name: (type_identifier) @name) @symbol
+        (enum_declaration name: (identifier) @name) @symbol
+        "#
+    }
+    fn parse_kind(&self, kind: &str) -> SymbolKind {
+        match kind {
+            "function_declaration" => SymbolKind::Function,
+            "class_declaration" => SymbolKind::Class,
+            "method_definition" => SymbolKind::Method,
+            "interface_declaration" => SymbolKind::Interface,
+            "enum_declaration" => SymbolKind::Unknown("Enum".to_string()),
+            _ => SymbolKind::Unknown(kind.to_string()),
+        }
+    }
+}
+
+pub struct TSXParser;
+impl LanguageParser for TSXParser {
+    fn language(&self) -> Language { tree_sitter_typescript::LANGUAGE_TSX.into() }
+    fn query_source(&self) -> &'static str {
+        r#"
+        (function_declaration name: (identifier) @name) @symbol
+        (class_declaration name: (type_identifier) @name) @symbol
+        (method_definition name: (property_identifier) @name) @symbol
+        (interface_declaration name: (type_identifier) @name) @symbol
+        "#
+    }
+    fn parse_kind(&self, kind: &str) -> SymbolKind {
+        match kind {
+            "function_declaration" => SymbolKind::Function,
+            "class_declaration" => SymbolKind::Class,
+            "method_definition" => SymbolKind::Method,
+            "interface_declaration" => SymbolKind::Interface,
+            _ => SymbolKind::Unknown(kind.to_string()),
+        }
+    }
+}
+
 pub struct Chunk {
     pub text: String,
     pub line: u32,
@@ -190,7 +255,9 @@ pub fn structural_chunk(content: &str, file_path: &Path) -> Vec<Chunk> {
     let parser: Box<dyn LanguageParser> = match extension {
         "rs" => Box::new(RustParser),
         "py" => Box::new(PythonParser),
-        "js" | "jsx" | "ts" | "tsx" => Box::new(JavaScriptParser),
+        "js" | "jsx" => Box::new(JavaScriptParser),
+        "ts" => Box::new(TypeScriptParser),
+        "tsx" => Box::new(TSXParser),
         _ => {
             return chunk_text_line_aware(content, 500, 50)
                 .into_iter()

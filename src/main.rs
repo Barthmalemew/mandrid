@@ -224,7 +224,7 @@ enum Command {
 
     /// Generate shell hooks for automated command capture.
     Hook {
-        /// Shell type (zsh, bash)
+        /// Shell type (zsh, bash, powershell)
         #[arg(default_value = "zsh")]
         shell: String,
     },
@@ -259,6 +259,21 @@ struct AskJsonResult {
 struct AskJsonPayload {
     question: String,
     results: Vec<AskJsonResult>,
+}
+
+fn get_ignore_matcher(root: &Path) -> ignore::gitignore::Gitignore {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    let gitignore_path = root.join(".gitignore");
+    if gitignore_path.exists() {
+        builder.add(gitignore_path);
+    }
+    // Also ignore Mandrid's own DB
+    builder.add_line(None, ".mem_db/").unwrap();
+    builder.build().unwrap()
+}
+
+fn is_ignored(matcher: &ignore::gitignore::Gitignore, path: &Path) -> bool {
+    matcher.matched(path, false).is_ignore()
 }
 
 #[tokio::main]
@@ -615,7 +630,7 @@ Run `mem context` to start.
             let abs_path = fs::canonicalize(&file_path).unwrap_or(file_path.clone());
             let rel_path = abs_path.strip_prefix(&project_root).unwrap_or(&abs_path);
             
-            let rows = digest_file_logic(&mut embedder, &abs_path, rel_path)?;
+            let rows = digest_file_logic(&mut embedder, &abs_path, rel_path).await?;
             add_rows(&table, rows).await?;
             println!("Digested {}", file_path.display());
         }
@@ -630,12 +645,16 @@ Run `mem context` to start.
                 db_file_map.insert(PathBuf::from(row.file_path), (row.mtime_secs, row.size_bytes));
             }
 
+            let matcher = get_ignore_matcher(&project_root);
             let mut files_to_process = Vec::new();
             for result in WalkBuilder::new(&root_dir).hidden(false).git_ignore(true).build() {
                 let entry = result?;
                 let path = entry.path().to_path_buf();
                 if entry.file_type().map(|t| t.is_file()).unwrap_or(false) && is_supported_file(&path) {
-                    let metadata = fs::metadata(&path)?;
+                    if is_ignored(&matcher, &path) {
+                        continue;
+                    }
+                    let metadata = tokio::fs::metadata(&path).await?;
                     let mtime = metadata.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
                     let size = metadata.len();
                     
@@ -659,7 +678,7 @@ Run `mem context` to start.
                     let c_dir = cache_dir.clone();
                     tasks.push(tokio::spawn(async move {
                         let mut embedder = init_embedder(c_dir, false)?;
-                        digest_file_logic(&mut embedder, &abs_file, &rel_file)
+                        digest_file_logic(&mut embedder, &abs_file, &rel_file).await
                     }));
                 }
                 for task in tasks {
@@ -970,6 +989,28 @@ mandrid_log_cmd() {{
 
 PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
 "#);
+            } else if shell == "powershell" || shell == "pwsh" {
+                println!(r#"
+# Mandrid PowerShell Hook
+# Add this to your $PROFILE: Invoke-Expression (& mem hook powershell)
+
+$MANDRID_CMD_START = 0
+
+function prompt {{
+    $exit_code = $?
+    $last_cmd = Get-History -Count 1
+    if ($last_cmd -and $MANDRID_LAST_CMD -eq $last_cmd.CommandLine) {{
+        $now = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+        $duration = $now - $MANDRID_CMD_START
+        # Log to Mandrid in background
+        Start-Process -FilePath "mem" -ArgumentList "log", "--tag", "terminal", "--session", "shell_history", "Command: $($last_cmd.CommandLine) | Status: $($exit_code) | Duration: $($duration)s" -NoNewWindow
+        $global:MANDRID_LAST_CMD = $null
+    }}
+    "PS $($executionContext.SessionState.Path.CurrentLocation)> "
+}}
+
+$global:MANDRID_LAST_CMD = $null
+"#);
             } else {
                 anyhow::bail!("Unsupported shell: {}", shell);
             }
@@ -980,13 +1021,14 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
             watcher.watch(&root_dir, RecursiveMode::Recursive)?;
             let table = open_or_create_table(&db_path).await?;
             let mut embedder = init_embedder(cache_dir.clone(), false)?;
+            let matcher = get_ignore_matcher(&project_root);
             for res in rx {
                 if let Ok(event) = res {
                     for path in event.paths {
-                        if is_supported_file(&path) {
+                        if is_supported_file(&path) && !is_ignored(&matcher, &path) {
                             let abs_path = fs::canonicalize(&path).unwrap_or(path.clone());
                             let rel_path = abs_path.strip_prefix(&project_root).unwrap_or(&abs_path);
-                            if let Ok(rows) = digest_file_logic(&mut embedder, &abs_path, rel_path) {
+                            if let Ok(rows) = digest_file_logic(&mut embedder, &abs_path, rel_path).await {
                                 let tag = format!("code:{}", rel_path.display());
                                 let _ = table.delete(format!("tag = '{}'", tag.replace('\'', "''")).as_str()).await;
                                 let _ = add_rows(&table, rows).await;
@@ -1009,18 +1051,21 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
             connection.initialize(server_capabilities)?;
             let table = open_or_create_table(&db_path).await?;
             let mut embedder = init_embedder(cache_dir.clone(), false)?;
+            let matcher = get_ignore_matcher(&project_root);
             for msg in &connection.receiver {
                 match msg {
                     Message::Notification(not) if not.method == DidChangeTextDocument::METHOD => {
                         let params: lsp_types::DidChangeTextDocumentParams = serde_json::from_value(not.params)?;
                         if let Ok(path) = params.text_document.uri.to_file_path() {
-                            if let Some(change) = params.content_changes.first() {
-                                let abs_path = fs::canonicalize(&path).unwrap_or(path.clone());
-                                let rel_path = abs_path.strip_prefix(&project_root).unwrap_or(&abs_path);
-                                if let Ok(rows) = digest_file_content_logic(&mut embedder, &change.text, &abs_path, rel_path) {
-                                    let tag = format!("code:{}", rel_path.display());
-                                    let _ = table.delete(format!("tag = '{}'", tag.replace('\'', "''")).as_str()).await;
-                                    let _ = add_rows(&table, rows).await;
+                            if !is_ignored(&matcher, &path) && is_supported_file(&path) {
+                                if let Some(change) = params.content_changes.first() {
+                                    let abs_path = fs::canonicalize(&path).unwrap_or(path.clone());
+                                    let rel_path = abs_path.strip_prefix(&project_root).unwrap_or(&abs_path);
+                                    if let Ok(rows) = digest_file_content_logic(&mut embedder, &change.text, &abs_path, rel_path).await {
+                                        let tag = format!("code:{}", rel_path.display());
+                                        let _ = table.delete(format!("tag = '{}'", tag.replace('\'', "''")).as_str()).await;
+                                        let _ = add_rows(&table, rows).await;
+                                    }
                                 }
                             }
                         }
@@ -1096,18 +1141,18 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
 }
 
 // Logic wrappers to bridge modules
-fn digest_file_logic(embedder: &mut TextEmbedding, abs_path: &Path, rel_path: &Path) -> Result<Vec<MemoryRow>> {
-    let content = fs::read_to_string(abs_path)?;
-    digest_file_content_logic(embedder, &content, abs_path, rel_path)
+async fn digest_file_logic(embedder: &mut TextEmbedding, abs_path: &Path, rel_path: &Path) -> Result<Vec<MemoryRow>> {
+    let content = tokio::fs::read_to_string(abs_path).await?;
+    digest_file_content_logic(embedder, &content, abs_path, rel_path).await
 }
 
-fn digest_file_content_logic(embedder: &mut TextEmbedding, content: &str, abs_path: &Path, rel_path: &Path) -> Result<Vec<MemoryRow>> {
+async fn digest_file_content_logic(embedder: &mut TextEmbedding, content: &str, abs_path: &Path, rel_path: &Path) -> Result<Vec<MemoryRow>> {
     let chunks = structural_chunk(content, abs_path);
     let docs: Vec<String> = chunks.iter().map(|c| format!("passage: {}", c.text)).collect();
     let refs_to_embed: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
     let embeddings = embedder.embed(refs_to_embed, None)?;
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
-    let metadata = fs::metadata(abs_path)?;
+    let metadata = tokio::fs::metadata(abs_path).await?;
     Ok(chunks.into_iter().zip(embeddings.into_iter()).map(|(chunk, vector)| MemoryRow {
         vector,
         text: chunk.text,

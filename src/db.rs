@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use futures::TryStreamExt;
 use lancedb::index::Index;
+use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::index::scalar::FtsIndexBuilder;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding, TextRerank, RerankerModel, RerankInitOptions};
 
@@ -176,6 +178,60 @@ pub async fn add_rows(table: &lancedb::Table, rows: Vec<MemoryRow>) -> Result<()
 
     table.add(Box::new(batches)).execute().await?;
     Ok(())
+}
+
+pub async fn ask_hybrid(
+    table: &lancedb::Table,
+    query_vector: &[f32],
+    query_text: &str,
+    limit: usize,
+    cache_dir: Option<PathBuf>,
+) -> Result<Vec<DecodedRow>> {
+    use lancedb::rerankers::rrf::RRFReranker;
+    use lancedb::index::scalar::FullTextSearchQuery;
+    use lancedb::query::{ExecutableQuery, QueryBase};
+
+    let query_builder = table.query().nearest_to(query_vector)?;
+    // Fetch 50 results for reranking
+    let stream = query_builder
+        .full_text_search(FullTextSearchQuery::new(query_text.to_owned()))
+        .rerank(Arc::new(RRFReranker::default()))
+        .limit(50)
+        .execute()
+        .await?;
+    
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+    let results = decode_rows(&batches, None)?;
+    
+    if results.is_empty() {
+        return Ok(results);
+    }
+
+    // Phase B: Reranking
+    let mut reranker = init_reranker(cache_dir, false)?;
+    let documents: Vec<&str> = results.iter().map(|r| r.text.as_str()).collect();
+    let reranked = reranker.rerank(query_text, documents.as_slice(), false, None)?;
+    
+    let mut indexed_results: Vec<_> = results.into_iter().enumerate().collect();
+    indexed_results.sort_by(|(idx_a, _), (idx_b, _)| {
+        let score_a = reranked.get(*idx_a).map(|r| r.score).unwrap_or(0.0);
+        let score_b = reranked.get(*idx_b).map(|r| r.score).unwrap_or(0.0);
+        score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    
+    Ok(indexed_results.into_iter().map(|(_, r)| r).take(limit).collect())
+}
+
+pub async fn find_impacted(
+    table: &lancedb::Table,
+    symbol_name: &str,
+) -> Result<Vec<DecodedRow>> {
+    // We search for chunks where 'references' JSON array contains the symbol name.
+    // Using a simple LIKE filter for now.
+    let filter = format!("references LIKE '%\"{}\"%'", symbol_name.replace('\'', "''"));
+    let stream = table.query().only_if(filter).execute().await?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+    decode_rows(&batches, None)
 }
 
 pub fn rows_to_batch(schema: SchemaRef, rows: &[MemoryRow]) -> Result<RecordBatch> {

@@ -1,6 +1,182 @@
 use std::collections::HashSet;
 use std::path::Path;
-use tree_sitter::Parser as TSParser;
+use tree_sitter::{Language, Parser as TSParser, Query, QueryCursor};
+use streaming_iterator::StreamingIterator;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct Symbol {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub range: TextRange,
+    pub content: String,
+    pub references: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub enum SymbolKind {
+    Function,
+    Method,
+    Struct,
+    Class,
+    Interface,
+    Trait,
+    Module,
+    Unknown(String),
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
+pub struct TextRange {
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+}
+
+pub trait LanguageParser {
+    fn language(&self) -> Language;
+    fn query_source(&self) -> &'static str;
+    
+    fn extract_symbols(&self, content: &str) -> anyhow::Result<Vec<Symbol>> {
+        let mut parser = TSParser::new();
+        parser.set_language(&self.language())?;
+        let tree = parser.parse(content, None).ok_or_else(|| anyhow::anyhow!("Failed to parse"))?;
+        let root = tree.root_node();
+        
+        let query = Query::new(&self.language(), self.query_source())?;
+        let mut cursor = QueryCursor::new();
+        let mut captures = cursor.captures(&query, root, content.as_bytes());
+        
+        let mut symbols = Vec::new();
+        while let Some(item) = captures.next() {
+            let (m, capture_index) = item;
+            let capture = m.captures[*capture_index];
+            let capture_name = query.capture_names()[capture.index as usize];
+            
+            if capture_name == "symbol" {
+                let node = capture.node;
+                let mut name = String::new();
+                let kind = self.parse_kind(node.kind());
+                
+                for c in m.captures {
+                    if query.capture_names()[c.index as usize] == "name" {
+                        name = content[c.node.start_byte()..c.node.end_byte()].to_string();
+                    }
+                }
+                
+                if name.is_empty() {
+                    name = node.child_by_field_name("name")
+                        .map(|n: tree_sitter::Node| content[n.start_byte()..n.end_byte()].to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                }
+                
+                let start = node.start_position();
+                let end = node.end_position();
+                
+                symbols.push(Symbol {
+                    name,
+                    kind,
+                    range: TextRange {
+                        start_line: start.row as u32 + 1,
+                        start_col: start.column as u32,
+                        end_line: end.row as u32 + 1,
+                        end_col: end.column as u32,
+                    },
+                    content: content[node.start_byte()..node.end_byte()].to_string(),
+                    references: self.find_references(node, content),
+                });
+            }
+        }
+        
+        Ok(symbols)
+    }
+
+    fn parse_kind(&self, kind: &str) -> SymbolKind;
+    
+    fn find_references(&self, node: tree_sitter::Node, content: &str) -> Vec<String> {
+        let mut refs = Vec::new();
+        let mut cursor = node.walk();
+        let mut reached_root = false;
+        while !reached_root {
+            let sub_node = cursor.node();
+            if sub_node.kind() == "call_expression" || sub_node.kind() == "call" {
+                if let Some(fn_node) = sub_node.child_by_field_name("function") {
+                    refs.push(content[fn_node.start_byte()..fn_node.end_byte()].to_string());
+                }
+            }
+
+            if cursor.goto_first_child() {
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() || cursor.node() == node {
+                    reached_root = true;
+                    break;
+                }
+            }
+        }
+        refs
+    }
+}
+
+pub struct RustParser;
+impl LanguageParser for RustParser {
+    fn language(&self) -> Language { tree_sitter_rust::LANGUAGE.into() }
+    fn query_source(&self) -> &'static str {
+        r#"
+        (function_item name: (identifier) @name) @symbol
+        (struct_item name: (type_identifier) @name) @symbol
+        (impl_item) @symbol
+        (trait_item name: (type_identifier) @name) @symbol
+        "#
+    }
+    fn parse_kind(&self, kind: &str) -> SymbolKind {
+        match kind {
+            "function_item" => SymbolKind::Function,
+            "struct_item" => SymbolKind::Struct,
+            "impl_item" => SymbolKind::Method,
+            "trait_item" => SymbolKind::Trait,
+            _ => SymbolKind::Unknown(kind.to_string()),
+        }
+    }
+}
+
+pub struct PythonParser;
+impl LanguageParser for PythonParser {
+    fn language(&self) -> Language { tree_sitter_python::LANGUAGE.into() }
+    fn query_source(&self) -> &'static str {
+        r#"
+        (function_definition name: (identifier) @name) @symbol
+        (class_definition name: (identifier) @name) @symbol
+        "#
+    }
+    fn parse_kind(&self, kind: &str) -> SymbolKind {
+        match kind {
+            "function_definition" => SymbolKind::Function,
+            "class_definition" => SymbolKind::Class,
+            _ => SymbolKind::Unknown(kind.to_string()),
+        }
+    }
+}
+
+pub struct JavaScriptParser;
+impl LanguageParser for JavaScriptParser {
+    fn language(&self) -> Language { tree_sitter_javascript::LANGUAGE.into() }
+    fn query_source(&self) -> &'static str {
+        r#"
+        (function_declaration name: (identifier) @name) @symbol
+        (class_declaration name: (identifier) @name) @symbol
+        (method_definition name: (property_identifier) @name) @symbol
+        "#
+    }
+    fn parse_kind(&self, kind: &str) -> SymbolKind {
+        match kind {
+            "function_declaration" => SymbolKind::Function,
+            "class_declaration" => SymbolKind::Class,
+            "method_definition" => SymbolKind::Method,
+            _ => SymbolKind::Unknown(kind.to_string()),
+        }
+    }
+}
 
 pub struct Chunk {
     pub text: String,
@@ -11,15 +187,31 @@ pub struct Chunk {
 
 pub fn structural_chunk(content: &str, file_path: &Path) -> Vec<Chunk> {
     let extension = file_path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    let language = match extension {
-        "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
-        "js" | "jsx" => Some(tree_sitter_javascript::LANGUAGE.into()),
-        "py" => Some(tree_sitter_python::LANGUAGE.into()),
-        _ => None,
+    let parser: Box<dyn LanguageParser> = match extension {
+        "rs" => Box::new(RustParser),
+        "py" => Box::new(PythonParser),
+        "js" | "jsx" | "ts" | "tsx" => Box::new(JavaScriptParser),
+        _ => {
+            return chunk_text_line_aware(content, 500, 50)
+                .into_iter()
+                .map(|(text, line)| Chunk {
+                    text,
+                    line,
+                    name: String::new(),
+                    references: Vec::new(),
+                })
+                .collect();
+        }
     };
 
-    let Some(lang) = language else {
-        return chunk_text_line_aware(content, 500, 50)
+    match parser.extract_symbols(content) {
+        Ok(symbols) => symbols.into_iter().map(|s| Chunk {
+            text: format!("[Context: {:?} {}]\n{}", s.kind, s.name, s.content),
+            line: s.range.start_line,
+            name: s.name,
+            references: s.references,
+        }).collect(),
+        Err(_) => chunk_text_line_aware(content, 500, 50)
             .into_iter()
             .map(|(text, line)| Chunk {
                 text,
@@ -27,108 +219,8 @@ pub fn structural_chunk(content: &str, file_path: &Path) -> Vec<Chunk> {
                 name: String::new(),
                 references: Vec::new(),
             })
-            .collect();
-    };
-
-    let mut parser = TSParser::new();
-    parser.set_language(&lang).expect("Error loading grammar");
-    let tree = parser.parse(content, None).expect("Error parsing");
-
-    let mut chunks = Vec::new();
-    let mut cursor = tree.walk();
-    let root = tree.root_node();
-
-    for node in root.children(&mut cursor) {
-        let kind = node.kind();
-        let mut symbol_name = String::new();
-        let mut refs = Vec::new();
-
-        if kind == "struct_item"
-            || kind == "impl_item"
-            || kind == "class_definition"
-            || kind == "function_definition"
-            || kind == "function_item"
-        {
-            symbol_name = node
-                .child_by_field_name("name")
-                .or_else(|| node.child_by_field_name("declarator"))
-                .map(|n| &content[n.start_byte()..n.end_byte()])
-                .unwrap_or("unknown")
-                .to_string();
-
-            // Extract references (basic call detection)
-            let mut sub_cursor = node.walk();
-            let mut reached_root = false;
-            while !reached_root {
-                let sub_node = sub_cursor.node();
-                if sub_node.kind() == "call_expression" || sub_node.kind() == "call" {
-                    if let Some(fn_node) = sub_node.child_by_field_name("function") {
-                        refs.push(content[fn_node.start_byte()..fn_node.end_byte()].to_string());
-                    }
-                }
-
-                if sub_cursor.goto_first_child() {
-                    continue;
-                }
-                while !sub_cursor.goto_next_sibling() {
-                    if !sub_cursor.goto_parent() || sub_cursor.node() == node {
-                        reached_root = true;
-                        break;
-                    }
-                }
-                if reached_root {
-                    break;
-                }
-            }
-        }
-
-        let start_byte = node.start_byte();
-        let end_byte = node.end_byte();
-        let text = &content[start_byte..end_byte];
-        let start_line = node.start_position().row as u32 + 1;
-
-        if text.len() > 1000 {
-            for (sub_text, sub_line) in chunk_text_line_aware(text, 1000, 100) {
-                let context_text = if !symbol_name.is_empty() {
-                    format!("[Context: {} {}]\n{}", kind, symbol_name, sub_text)
-                } else {
-                    sub_text
-                };
-                chunks.push(Chunk {
-                    text: context_text,
-                    line: start_line + sub_line - 1,
-                    name: symbol_name.clone(),
-                    references: refs.clone(),
-                });
-            }
-        } else if text.len() > 20 {
-            let context_text = if !symbol_name.is_empty() {
-                format!("[Context: {} {}]\n{}", kind, symbol_name, text)
-            } else {
-                text.to_string()
-            };
-            chunks.push(Chunk {
-                text: context_text,
-                line: start_line,
-                name: symbol_name,
-                references: refs,
-            });
-        }
+            .collect(),
     }
-
-    if chunks.is_empty() && !content.trim().is_empty() {
-        return chunk_text_line_aware(content, 500, 50)
-            .into_iter()
-            .map(|(text, line)| Chunk {
-                text,
-                line,
-                name: String::new(),
-                references: Vec::new(),
-            })
-            .collect();
-    }
-
-    chunks
 }
 
 pub fn chunk_text_line_aware(text: &str, chunk_size: usize, overlap: usize) -> Vec<(String, u32)> {

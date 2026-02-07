@@ -96,6 +96,26 @@ enum Command {
         /// Output in a more human-friendly format
         #[arg(long)]
         human: bool,
+        /// Output in machine-readable JSON format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Record a reasoning trace or strategic plan.
+    Think {
+        text: String,
+        #[arg(long)]
+        session: Option<String>,
+    },
+
+    /// Compress old episodic memories to reduce noise.
+    Compress {
+        /// Session to compress (default: all)
+        #[arg(long)]
+        session: Option<String>,
+        /// Minimum age in days
+        #[arg(long, default_value_t = 1)]
+        days: u64,
     },
 
     /// Manage high-level development tasks.
@@ -176,10 +196,24 @@ enum Command {
         commits: usize,
     },
 
+    /// Calculate the "Blast Radius" of a symbol (who depends on this?).
+    Impact {
+        symbol: String,
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
+    },
+
     /// Launch the Mandrid Web Dashboard.
     Serve {
         #[arg(long, default_value_t = 3000)]
         port: u16,
+    },
+
+    /// Generate shell hooks for automated command capture.
+    Hook {
+        /// Shell type (zsh, bash)
+        #[arg(default_value = "zsh")]
+        shell: String,
     },
 
     /// Start a minimal LSP server to receive real-time code changes.
@@ -271,6 +305,98 @@ async fn main() -> Result<()> {
             add_rows(&table, vec![row]).await?;
             println!("Logged interaction");
         }
+        Command::Think { text, session } => {
+            let mut embedder = init_embedder(cache_dir.clone(), true)?;
+            let table = open_or_create_table(&db_path).await?;
+
+            let embedding = embed_prefixed(&mut embedder, "thought", &text)?;
+            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+            let row = MemoryRow {
+                vector: embedding,
+                text,
+                tag: "thinking".to_string(),
+                memory_type: "thought".to_string(),
+                file_path: "agent_brain".to_string(),
+                line_start: 0,
+                session_id: session.unwrap_or_else(|| "default".to_string()),
+                name: String::new(),
+                references: "[]".to_string(),
+                depends_on: "[]".to_string(),
+                status: "active".to_string(),
+                mtime_secs: 0,
+                size_bytes: 0,
+                created_at: now,
+            };
+            add_rows(&table, vec![row]).await?;
+            println!("Thought recorded.");
+        }
+        Command::Compress { session, days } => {
+            let table = open_table(&db_path).await?;
+            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+            let threshold = now - (days * 86400);
+
+            let mut filter = format!("created_at < {} AND memory_type IN ('trace', 'git_reasoning')", threshold);
+            if let Some(s) = session {
+                filter.push_str(&format!(" AND session_id = '{}'", s.replace('\'', "''")));
+            }
+
+            println!("🗜️ Scanning for memories to compress...");
+            let stream = table.query().only_if(filter.clone()).execute().await?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+            let rows = decode_rows(&batches, None)?;
+
+            if rows.is_empty() {
+                println!("No old episodic memories found.");
+                return Ok(());
+            }
+
+            // Group by session
+            let mut session_groups: HashMap<String, Vec<DecodedRow>> = HashMap::new();
+            for r in rows {
+                session_groups.entry(r.session_id.clone()).or_default().push(r);
+            }
+
+            for (session_id, group) in session_groups {
+                let total = group.len();
+                let failures = group.iter().filter(|r| r.status == "failure").count();
+                let last_success = group.iter().rev().find(|r| r.status == "success");
+
+                let summary_text = format!(
+                    "SESSION SUMMARY [{}]: Compressed {} traces. Encountered {} failures. Final achievement: {}",
+                    session_id,
+                    total,
+                    failures,
+                    last_success.map(|r| r.text.lines().next().unwrap_or("n/a")).unwrap_or("None")
+                );
+
+                // Create the summary
+                let mut embedder = init_embedder(cache_dir.clone(), false)?;
+                let embedding = embed_prefixed(&mut embedder, "summary", &summary_text)?;
+                let summary_row = MemoryRow {
+                    vector: embedding,
+                    text: summary_text,
+                    tag: format!("summary:{}", session_id),
+                    memory_type: "summary".to_string(),
+                    file_path: "mandrid_archive".to_string(),
+                    line_start: 0,
+                    session_id: session_id.clone(),
+                    name: "compression_job".to_string(),
+                    references: "[]".to_string(),
+                    depends_on: "[]".to_string(),
+                    status: "archived".to_string(),
+                    mtime_secs: 0,
+                    size_bytes: 0,
+                    created_at: now,
+                };
+
+                add_rows(&table, vec![summary_row]).await?;
+                println!("✅ Created summary for session: {}", session_id);
+            }
+
+            // Delete the old noisy rows
+            table.delete(&filter).await?;
+            println!("🗑️ Deleted old episodic traces.");
+        }
         Command::Capture { reasoning, session } => {
             let mut embedder = init_embedder(cache_dir.clone(), true)?;
             let table = open_or_create_table(&db_path).await?;
@@ -304,7 +430,7 @@ async fn main() -> Result<()> {
             add_rows(&table, vec![row]).await?;
             println!("Context captured");
         }
-        Command::Context { session, limit, file, human } => {
+        Command::Context { session, limit, file, human, json } => {
             let table = open_table(&db_path).await.with_context(|| {
                 format!("Database not found at {}. Run `mem init` first.", db_path.display())
             })?;
@@ -322,18 +448,38 @@ async fn main() -> Result<()> {
             let task_batches: Vec<RecordBatch> = task_stream.try_collect().await?;
             let active_tasks = decode_rows(&task_batches, None)?;
 
-            let mut filter = format!("(session_id = '{}' OR memory_type = 'manual' OR memory_type = 'task')", session_id.replace('\'', "''"));
+            // 3. Get Recent Thoughts
+            let thought_stream = table.query().only_if("memory_type = 'thought' AND status = 'active'").limit(5).execute().await?;
+            let thought_batches: Vec<RecordBatch> = thought_stream.try_collect().await?;
+            let active_thoughts = decode_rows(&thought_batches, None)?;
+
+            // 4. Get Recent Failures (Negative Memory)
+            let failure_stream = table.query().only_if("memory_type = 'trace' AND status = 'failure'").limit(3).execute().await?;
+            let failure_batches: Vec<RecordBatch> = failure_stream.try_collect().await?;
+            let recent_failures = decode_rows(&failure_batches, None)?;
+
+            let mut filter = format!("(session_id = '{}' OR memory_type = 'manual' OR memory_type = 'task' OR memory_type = 'thought')", session_id.replace('\'', "''"));
             
             if let Some(f) = file {
                 let abs_path = fs::canonicalize(&f).unwrap_or(f);
-                filter.push_str(&format!(" AND (file_path = '{}' OR memory_type = 'manual' OR memory_type = 'task')", abs_path.display().to_string().replace('\'', "''")));
+                filter.push_str(&format!(" AND (file_path = '{}' OR memory_type = 'manual' OR memory_type = 'task' OR memory_type = 'thought')", abs_path.display().to_string().replace('\'', "''")));
             }
 
             let stream = table.query().only_if(filter).limit(limit).execute().await?;
             let batches: Vec<RecordBatch> = stream.try_collect().await?;
             let rows = decode_rows(&batches, None)?;
 
-            if human {
+            if json {
+                let payload = serde_json::json!({
+                    "role": role,
+                    "session_id": session_id,
+                    "active_tasks": active_tasks,
+                    "active_thoughts": active_thoughts,
+                    "recent_failures": recent_failures,
+                    "memories": rows
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else if human {
                 println!("=== MANDRID STATE SUMMARY ===");
                 println!("Role: {}", role.to_uppercase());
                 println!("Active Session: {}", session_id);
@@ -341,6 +487,18 @@ async fn main() -> Result<()> {
                     println!("\n[Active Tasks]");
                     for t in active_tasks {
                         println!("- {}: {}", t.tag.unwrap_or_default(), t.text);
+                    }
+                }
+                if !active_thoughts.is_empty() {
+                    println!("\n[🧠 BRAIN DUMP]");
+                    for t in &active_thoughts {
+                        println!("- {}", t.text);
+                    }
+                }
+                if !recent_failures.is_empty() {
+                    println!("\n[⚠️ RECENT FAILURES]");
+                    for f in &recent_failures {
+                        println!("- {}: {}", f.tag.as_ref().unwrap_or(&"unknown".to_string()), f.text.lines().next().unwrap_or(""));
                     }
                 }
                 println!("\n[Recent Memories]");
@@ -361,9 +519,24 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                if !active_thoughts.is_empty() {
+                    println!("\n## 🧠 ACTIVE REASONING");
+                    for t in &active_thoughts {
+                        println!("{}", t.text);
+                    }
+                }
+
+                if !recent_failures.is_empty() {
+                    println!("\n## ⚠️ RECENT FAILURES (Negative Memory)");
+                    for task in &recent_failures {
+                        println!("- **{}**: {}", task.tag.as_ref().unwrap_or(&"unknown".to_string()), task.text.lines().next().unwrap_or(""));
+                    }
+                    println!("Avoid repeating the mistakes captured in these traces.");
+                }
+
                 println!("\n## Active Session: {}", session_id);
                 for row in rows {
-                    if row.memory_type == "task" && row.status == "active" { continue; }
+                    if (row.memory_type == "task" || row.memory_type == "thought") && row.status == "active" { continue; }
                     println!("\n## {} ({})", row.tag.unwrap_or_else(|| "unknown".to_string()), row.memory_type);
                     if row.memory_type == "code" {
                         println!("File: {}:{}", row.file_path, row.line_start);
@@ -496,32 +669,30 @@ Run `mem context` to start.
             }
 
             let query_embedding = embed_prefixed(&mut embedder, "query", &final_query)?;
-            let fetch_limit = if rerank { limit.max(10) * 2 } else { limit };
-            let mut results = ask_table_logic(&table, &query_embedding, &final_query, fetch_limit, vector_only).await?;
-
-            if rerank && !results.is_empty() {
-                let mut reranker = init_reranker(cache_dir.clone(), !json_output)?;
-                let documents: Vec<&str> = results.iter().map(|r| r.text.as_str()).collect();
-                let reranked = reranker.rerank(final_query.as_str(), documents.as_slice(), false, None)?;
-                
-                let mut indexed_results: Vec<_> = results.into_iter().enumerate().collect();
-                indexed_results.sort_by(|(idx_a, _), (idx_b, _)| {
-                    let score_a = reranked.get(*idx_a).map(|r| r.score).unwrap_or(0.0);
-                    let score_b = reranked.get(*idx_b).map(|r| r.score).unwrap_or(0.0);
-                    score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                
-                results = indexed_results.into_iter().map(|(_, r)| r).take(limit).collect();
-            } else if rerank {
-                results = results.into_iter().take(limit).collect();
-            }
-
+            
+            let results = if rerank {
+                ask_hybrid(&table, &query_embedding, &final_query, limit, cache_dir.clone()).await?
+            } else {
+                ask_table_logic(&table, &query_embedding, &final_query, limit, vector_only).await?
+            };
 
             if json_output {
-                println!("{}", serde_json::to_string(&AskJsonPayload { question, results: results.into_iter().enumerate().map(|(i, r)| AskJsonResult { rank: i+1, tag: r.tag, text: r.text, memory_type: r.memory_type, file_path: Some(r.file_path), line_start: Some(r.line_start), created_at: r.created_at }).collect() })?);
+                let payload = AskJsonPayload {
+                    question,
+                    results: results.into_iter().enumerate().map(|(i, r)| AskJsonResult {
+                        rank: i + 1,
+                        tag: r.tag,
+                        text: r.text,
+                        memory_type: r.memory_type,
+                        file_path: Some(r.file_path),
+                        line_start: Some(r.line_start),
+                        created_at: r.created_at,
+                    }).collect(),
+                };
+                println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
                 for (i, r) in results.into_iter().enumerate() {
-                    println!("\n{}. [{}] ({}:{})", i+1, r.tag.unwrap_or_default(), r.file_path, r.line_start);
+                    println!("\n{}. [{}] ({}:{})", i + 1, r.tag.unwrap_or_default(), r.file_path, r.line_start);
                     println!("{}", r.text);
                 }
             }
@@ -650,6 +821,32 @@ Run `mem context` to start.
                 }
             }
         }
+        Command::Impact { symbol, depth } => {
+            let table = open_table(&db_path).await?;
+            println!("🔍 Calculating Blast Radius for: {}", symbol);
+            
+            let mut seen = std::collections::HashSet::new();
+            let mut to_process = vec![(symbol.clone(), 0)];
+            seen.insert(symbol.clone());
+
+            while let Some((current_symbol, current_depth)) = to_process.pop() {
+                if current_depth >= depth { continue; }
+
+                let impacted = find_impacted(&table, &current_symbol).await?;
+                if impacted.is_empty() { continue; }
+
+                for row in impacted {
+                    let name = if row.name.is_empty() { "anonymous".to_string() } else { row.name.clone() };
+                    let indent = "  ".repeat(current_depth + 1);
+                    println!("{}↳ {} ({}:{})", indent, name, row.file_path, row.line_start);
+                    
+                    if !seen.contains(&name) {
+                        seen.insert(name.clone());
+                        to_process.push((name, current_depth + 1));
+                    }
+                }
+            }
+        }
         Command::SyncGit { commits } => {
             let table = open_or_create_table(&db_path).await?;
             let mut embedder = init_embedder(cache_dir.clone(), true)?;
@@ -703,6 +900,52 @@ Run `mem context` to start.
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
             println!("🚀 Mandrid Dashboard at http://localhost:{}", port);
             axum::serve(listener, app).await?;
+        }
+        Command::Hook { shell } => {
+            if shell == "zsh" {
+                println!(r#"
+# Mandrid Zsh Hook
+# Source this in your .zshrc: source <(mem hook zsh)
+
+mandrid_preexec() {{
+    export MANDRID_LAST_CMD="$1"
+    export MANDRID_CMD_START=$(date +%s)
+}}
+
+mandrid_precmd() {{
+    local exit_code=$?
+    if [ -n "$MANDRID_LAST_CMD" ]; then
+        local now=$(date +%s)
+        local duration=$((now - MANDRID_CMD_START))
+        # Log to Mandrid in background to avoid terminal lag
+        (mem log --tag terminal "Command: $MANDRID_LAST_CMD | Status: $exit_code | Duration: ${{duration}}s" --session shell_history >/dev/null 2>&1 &)
+        unset MANDRID_LAST_CMD
+    fi
+}}
+
+autoload -Uz add-zsh-hook
+add-zsh-hook preexec mandrid_preexec
+add-zsh-hook precmd mandrid_precmd
+"#);
+            } else if shell == "bash" {
+                println!(r#"
+# Mandrid Bash Hook
+# Source this in your .bashrc: source <(mem hook bash)
+
+mandrid_log_cmd() {{
+    local exit_code=$?
+    local last_cmd=$(history 1 | sed 's/^[ ]*[0-9]*  //')
+    # Filter out empty commands or the log command itself
+    if [[ -n "$last_cmd" && "$last_cmd" != "mem log"* ]]; then
+        (mem log --tag terminal "Command: $last_cmd | Status: $exit_code" --session shell_history >/dev/null 2>&1 &)
+    fi
+}}
+
+PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
+"#);
+            } else {
+                anyhow::bail!("Unsupported shell: {}", shell);
+            }
         }
         Command::Watch { root_dir } => {
             let (tx, rx) = channel();

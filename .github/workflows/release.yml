@@ -43,3 +43,5 @@ jobs:
           asset_name: ${{ matrix.asset_name }}
           tag: ${{ github.ref }}
           overwrite: true
+          release_name: "Mandrid ${{ github.ref_name }}"
+          body: "Automated release for Mandrid ${{ github.ref_name }}"

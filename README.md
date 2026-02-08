@@ -78,8 +78,14 @@ Mandrid utilizes `fastembed` for local inference.
    ```
 
 7. **Analyze impact:**
+    ```bash
+    mem impact handle_request --depth 2
+    ```
+
+8. **Prune old memories (optional):**
    ```bash
-   mem impact handle_request --depth 2
+   mem prune --days 30 --types trace,auto --dry-run
+   mem prune --days 30 --types trace,auto
    ```
 
 ## 🏗 Technical Stack

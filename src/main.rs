@@ -242,6 +242,29 @@ enum Command {
         days: u64,
     },
 
+    /// Permanently delete old memories by type.
+    Prune {
+        /// Minimum age in days
+        #[arg(long, default_value_t = 30)]
+        days: u64,
+
+        /// Memory types to prune (comma-separated). Defaults to trace,auto.
+        #[arg(long, value_delimiter = ',')]
+        types: Vec<String>,
+
+        /// Session to prune (default: all)
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Keep failure traces (status = failure)
+        #[arg(long, default_value_t = true)]
+        keep_failures: bool,
+
+        /// Show counts without deleting
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Manage high-level development tasks.
     Task {
         #[command(subcommand)]
@@ -357,6 +380,18 @@ enum Command {
         /// Off by default to keep packs small.
         #[arg(long)]
         include_reasoning: bool,
+
+        /// Only include episodic memories newer than this many days.
+        #[arg(long)]
+        max_age_days: Option<u64>,
+
+        /// Include only these episodic memory types (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        include_types: Vec<String>,
+
+        /// Exclude these episodic memory types (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        exclude_types: Vec<String>,
 
         /// Enable Cross-Encoder reranking (slower; optional).
         #[arg(long)]
@@ -856,6 +891,21 @@ fn truncate_for_trace(text: &str, max_chars: usize) -> (String, bool) {
     } else {
         (text.to_string(), false)
     }
+}
+
+fn normalize_memory_types(types: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for t in types {
+        let trimmed = t.trim().to_lowercase();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.clone()) {
+            out.push(trimmed);
+        }
+    }
+    out
 }
 
 fn auto_dir(project_root: &Path) -> PathBuf {
@@ -1493,15 +1543,32 @@ fn build_file_change_entry(
     }))
 }
 
+async fn prune_auto_entries(table: &lancedb::Table, max_age_days: u64) -> Result<()> {
+    if max_age_days == 0 {
+        return Ok(());
+    }
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+    let threshold = now.saturating_sub(max_age_days.saturating_mul(86400));
+    let filter = format!("memory_type = 'auto' AND created_at < {}", threshold);
+    table.delete(&filter).await?;
+    Ok(())
+}
+
 async fn store_auto_entries(
     db_path: &Path,
     cache_dir: Option<PathBuf>,
     entries: &[AutoEntry],
+    prune_days: Option<u64>,
 ) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
     let table = open_or_create_table(db_path).await?;
+    if let Some(days) = prune_days {
+        if days > 0 {
+            let _ = prune_auto_entries(&table, days).await;
+        }
+    }
     let mut embedder = init_embedder(cache_dir, false)?;
     let mut rows = Vec::new();
     for entry in entries {
@@ -1893,6 +1960,64 @@ async fn main() -> Result<()> {
             // Delete the old noisy rows
             table.delete(&filter).await?;
             println!("🗑️ Deleted old episodic traces.");
+        }
+        Command::Prune {
+            days,
+            types,
+            session,
+            keep_failures,
+            dry_run,
+        } => {
+            let table = open_table(&db_path).await?;
+            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+            let threshold = now.saturating_sub(days.saturating_mul(86400));
+
+            let mut types = normalize_memory_types(&types);
+            if types.is_empty() {
+                types = vec!["trace".to_string(), "auto".to_string()];
+            }
+
+            let mut filter_parts = vec![format!("created_at < {}", threshold)];
+            if !types.is_empty() {
+                let list = types
+                    .iter()
+                    .map(|t| format!("'{}'", escape_lancedb_str(t)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                filter_parts.push(format!("memory_type IN ({})", list));
+            }
+            if keep_failures {
+                filter_parts.push("status != 'failure'".to_string());
+            }
+            if let Some(s) = session {
+                filter_parts.push(format!(
+                    "session_id = '{}'",
+                    escape_lancedb_str(&s)
+                ));
+            }
+            let filter = filter_parts.join(" AND ");
+
+            if dry_run {
+                let stream = table.query().only_if(filter.clone()).execute().await?;
+                let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                let rows = decode_rows(&batches, None)?;
+                if rows.is_empty() {
+                    println!("No memories matched the prune filter.");
+                    return Ok(());
+                }
+                let mut counts: HashMap<String, usize> = HashMap::new();
+                for row in rows {
+                    *counts.entry(row.memory_type).or_insert(0) += 1;
+                }
+                println!("Prune dry run (older than {} days):", days);
+                for (kind, count) in counts.iter() {
+                    println!("- {}: {}", kind, count);
+                }
+                return Ok(());
+            }
+
+            table.delete(&filter).await?;
+            println!("Pruned memories older than {} days.", days);
         }
         Command::Capture { reasoning, paths, max_bytes, session } => {
             let mut embedder = init_embedder(cache_dir.clone(), true)?;
@@ -2608,6 +2733,9 @@ Your current assigned role: **{}**
             k_code,
             include_code,
             include_reasoning,
+            max_age_days,
+            include_types,
+            exclude_types,
             rerank,
             vector_only,
             json,
@@ -2687,19 +2815,47 @@ Your current assigned role: **{}**
             let mut embedder = init_embedder(cache_dir.clone(), false)?;
             let query_embedding = embed_prefixed(&mut embedder, "query", &input)?;
 
-            let episodic_filter = match scope {
-                ContextScope::Session => format!(
-                    "memory_type != 'code' AND memory_type != 'system_config' AND session_id = '{}'{}",
-                    escape_lancedb_str(&session_id),
-                    if include_reasoning { "" } else { " AND memory_type != 'reasoning'" }
-                ),
-                ContextScope::Project => {
-                    format!(
-                        "memory_type != 'code' AND memory_type != 'system_config'{}",
-                        if include_reasoning { "" } else { " AND memory_type != 'reasoning'" }
-                    )
+            let include_types = normalize_memory_types(&include_types);
+            let exclude_types = normalize_memory_types(&exclude_types);
+            let mut filter_parts = vec![
+                "memory_type != 'code'".to_string(),
+                "memory_type != 'system_config'".to_string(),
+            ];
+            if !include_reasoning {
+                filter_parts.push("memory_type != 'reasoning'".to_string());
+            }
+            if let Some(days) = max_age_days {
+                let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+                let window = days.saturating_mul(86400);
+                if window > 0 {
+                    let threshold = now.saturating_sub(window);
+                    filter_parts.push(format!("created_at >= {}", threshold));
                 }
-            };
+            }
+            if !include_types.is_empty() {
+                let list = include_types
+                    .iter()
+                    .map(|t| format!("'{}'", escape_lancedb_str(t)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                filter_parts.push(format!("memory_type IN ({})", list));
+            }
+            if !exclude_types.is_empty() {
+                let list = exclude_types
+                    .iter()
+                    .map(|t| format!("'{}'", escape_lancedb_str(t)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                filter_parts.push(format!("memory_type NOT IN ({})", list));
+            }
+            match scope {
+                ContextScope::Session => filter_parts.push(format!(
+                    "session_id = '{}'",
+                    escape_lancedb_str(&session_id)
+                )),
+                ContextScope::Project => {}
+            }
+            let episodic_filter = filter_parts.join(" AND ");
 
             let mut reranker = if rerank {
                 Some(init_reranker(cache_dir.clone(), false)?)
@@ -3595,7 +3751,13 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
 
                     if let Some(entry) = entry {
                         if config.review.auto_approve {
-                            store_auto_entries(&db_path, cache_dir.clone(), &[entry]).await?;
+                            store_auto_entries(
+                                &db_path,
+                                cache_dir.clone(),
+                                &[entry],
+                                Some(config.ttl.default_days),
+                            )
+                            .await?;
                             println!("Auto memory saved.");
                         } else {
                             append_auto_queue(&project_root, &entry)?;
@@ -3649,7 +3811,14 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
                         return Ok(());
                     }
 
-                    store_auto_entries(&db_path, cache_dir.clone(), &approved).await?;
+                    let config = load_auto_config(&project_root)?;
+                    store_auto_entries(
+                        &db_path,
+                        cache_dir.clone(),
+                        &approved,
+                        Some(config.ttl.default_days),
+                    )
+                    .await?;
                     write_auto_queue(&project_root, &remaining)?;
                     println!("Approved {} auto memories.", approved.len());
                 }
@@ -3959,6 +4128,7 @@ You are equipped with Mandrid, a local persistent memory layer. Use these tools 
  ## Maintenance
  - `mem rebuild`: Rebuild the local DB after significant Mandrid updates (backs up `.mem_db`, regenerates it).
  - `mem doctor`: Diagnose DB health/version and show backups.
+ - `mem prune`: Delete old memories by type and age.
 
 ## Data Model (practical)
 - `memory_type=code`: indexed code chunks (AST-based)
@@ -3983,10 +4153,11 @@ You are equipped with Mandrid, a local persistent memory layer. Use these tools 
                           { "name": "mem think", "description": "Persist internal reasoning." },
                           { "name": "mem run", "description": "Execute terminal commands with telemetry capture." },
                           { "name": "mem auto", "description": "Deterministic auto-memory from git/command events." },
-                         { "name": "mem rebuild", "description": "Rebuild the local DB after a Mandrid update." },
-                         { "name": "mem doctor", "description": "Diagnose DB health/version and show backups." }
-                     ]
-                 });
+                          { "name": "mem rebuild", "description": "Rebuild the local DB after a Mandrid update." },
+                          { "name": "mem doctor", "description": "Diagnose DB health/version and show backups." },
+                          { "name": "mem prune", "description": "Delete old memories by type and age." }
+                      ]
+                  });
                 println!("{}", serde_json::to_string_pretty(&schema)?);
             }
         }

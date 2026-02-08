@@ -393,6 +393,10 @@ enum Command {
         #[arg(long, value_delimiter = ',')]
         exclude_types: Vec<String>,
 
+        /// Per-type caps for episodic memories (comma-separated, e.g. trace=2,thought=1)
+        #[arg(long, value_delimiter = ',')]
+        type_caps: Vec<String>,
+
         /// Enable Cross-Encoder reranking (slower; optional).
         #[arg(long)]
         rerank: bool,
@@ -903,6 +907,26 @@ fn normalize_memory_types(types: &[String]) -> Vec<String> {
         }
         if seen.insert(trimmed.clone()) {
             out.push(trimmed);
+        }
+    }
+    out
+}
+
+fn parse_type_caps(items: &[String]) -> HashMap<String, usize> {
+    let mut out = HashMap::new();
+    for raw in items {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.splitn(2, '=');
+        let key = parts.next().unwrap_or("").trim().to_lowercase();
+        let value = parts.next().unwrap_or("").trim();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        if let Ok(cap) = value.parse::<usize>() {
+            out.insert(key, cap);
         }
     }
     out
@@ -2736,6 +2760,7 @@ Your current assigned role: **{}**
             max_age_days,
             include_types,
             exclude_types,
+            type_caps,
             rerank,
             vector_only,
             json,
@@ -2817,6 +2842,7 @@ Your current assigned role: **{}**
 
             let include_types = normalize_memory_types(&include_types);
             let exclude_types = normalize_memory_types(&exclude_types);
+            let type_caps = parse_type_caps(&type_caps);
             let mut filter_parts = vec![
                 "memory_type != 'code'".to_string(),
                 "memory_type != 'system_config'".to_string(),
@@ -2926,6 +2952,23 @@ Your current assigned role: **{}**
                     }
                 }
                 episodic_rows = deduped;
+            }
+
+            if !type_caps.is_empty() && !episodic_rows.is_empty() {
+                let mut counts: HashMap<String, usize> = HashMap::new();
+                let mut capped = Vec::with_capacity(episodic_rows.len());
+                for row in episodic_rows.into_iter() {
+                    let key = row.memory_type.to_lowercase();
+                    if let Some(limit) = type_caps.get(&key) {
+                        let entry = counts.entry(key).or_insert(0);
+                        if *entry >= *limit {
+                            continue;
+                        }
+                        *entry += 1;
+                    }
+                    capped.push(row);
+                }
+                episodic_rows = capped;
             }
 
             if !code_rows.is_empty() {

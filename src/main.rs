@@ -767,30 +767,6 @@ Your current assigned role: **{}**
                 }
             }
 
-
-            let matcher = get_ignore_matcher(&project_root);
-            let mut files_to_process = Vec::new();
-            for result in WalkBuilder::new(&root_dir).hidden(false).git_ignore(true).build() {
-                let entry = result?;
-                let path = entry.path().to_path_buf();
-                if entry.file_type().map(|t| t.is_file()).unwrap_or(false) && is_supported_file(&path) {
-                    if is_ignored(&matcher, &path) {
-                        continue;
-                    }
-                    let metadata = tokio::fs::metadata(&path).await?;
-                    let mtime = metadata.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
-                    let size = metadata.len();
-                    
-                    let abs_path = fs::canonicalize(&path).unwrap_or(path.clone());
-                    let rel_path = abs_path.strip_prefix(&project_root).unwrap_or(&abs_path).to_path_buf();
-
-                    if let Some(&(db_mtime, db_size)) = db_file_map.get(&rel_path) {
-                        if db_mtime == mtime && db_size == size { continue; }
-                    }
-                    files_to_process.push((abs_path, rel_path));
-                }
-            }
-
             println!("Indexing {} files...", files_to_process.len());
             let mut processed = 0;
             for chunk in files_to_process.chunks(concurrency) {

@@ -14,6 +14,11 @@
     };
   };
 
+  nixConfig = {
+    extra-substituters = [ "https://mandrid.cachix.org" ];
+    extra-trusted-public-keys = [ "mandrid.cachix.org-1:nS+Jj4Qe8OInF/eYhB+W59Y/W8O+v4M0W1L+9+e7Q8A=" ];
+  };
+
   outputs = { self, nixpkgs, flake-utils, crane, fenix, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let

@@ -55,6 +55,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
+      - name: Install Nix
+        if: matrix.os != 'windows-latest'
+        uses: cachix/install-nix-action@v30
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Cachix
+        if: matrix.os != 'windows-latest'
+        uses: cachix/cachix-action@v15
+        with:
+          name: mandrid
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -68,7 +81,11 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build
+      - name: Build with Nix (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: nix build .#mandrid
+
+      - name: Build with Cargo (all platforms)
         run: cargo build --locked --release
 
       - name: Upload binaries to release

@@ -97,7 +97,29 @@ pub async fn open_or_create_table(db_path: &Path) -> Result<lancedb::Table> {
         .await?;
 
     match db.open_table(DEFAULT_TABLE_NAME).execute().await {
-        Ok(table) => Ok(table),
+        Ok(table) => {
+            // Validate schema
+            let actual_schema = table.schema().await?;
+            let expected_schema = memory_schema();
+            
+            let actual_fields: std::collections::HashSet<_> = actual_schema.fields().iter().map(|f| f.name()).collect();
+            let mut missing = Vec::new();
+            for field in expected_schema.fields() {
+                if !actual_fields.contains(field.name()) {
+                    missing.push(field.name().to_string());
+                }
+            }
+
+            if !missing.is_empty() {
+                anyhow::bail!(
+                    "Database schema mismatch. Missing fields: {:?}.\n\
+                    The database format has changed to support new features (like Blast Radius and Telemetry).\n\
+                    Please run `rm -rf .mem_db` and re-initialize with `mem init`.",
+                    missing
+                );
+            }
+            Ok(table)
+        },
         Err(_) => {
             let schema = memory_schema();
             let empty = empty_record_batch(schema.clone())?;
@@ -120,10 +142,8 @@ pub async fn open_or_create_table(db_path: &Path) -> Result<lancedb::Table> {
 }
 
 pub async fn open_table(db_path: &Path) -> Result<lancedb::Table> {
-    let db = lancedb::connect(db_path.to_str().context("Invalid db path")?)
-        .execute()
-        .await?;
-    Ok(db.open_table(DEFAULT_TABLE_NAME).execute().await?)
+    let table = open_or_create_table(db_path).await?;
+    Ok(table)
 }
 
 pub async fn check_risk(

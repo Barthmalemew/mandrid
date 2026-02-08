@@ -29,7 +29,11 @@
 
         # Common native dependencies
         commonArgs = {
-          src = craneLib.cleanCargoSource (craneLib.path ./.);
+          src = pkgs.lib.cleanSourceWith {
+            src = craneLib.path ./.;
+            filter = path: type:
+              (pkgs.lib.hasSuffix ".html" (toString path)) || (craneLib.filterCargoSources path type);
+          };
           strictDeps = true;
 
           buildInputs = with pkgs; [

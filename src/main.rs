@@ -589,6 +589,11 @@ async fn main() -> Result<()> {
                     println!("- [{}] {}", row.tag.unwrap_or_default(), row.text.lines().next().unwrap_or(""));
                 }
             } else {
+                println!("<mandrid_context_guide>");
+                println!("Mandrid is a memory layer for you. Use `mem ask` for search and `mem impact` for blast-radius.");
+                println!("Run `mem context` frequently to keep your context window lean but relevant.");
+                println!("</mandrid_context_guide>\n");
+
                 println!("<project_context>");
                 println!("## AI Agent Role: {}", role.to_uppercase());
                 if role == "assistant" {
@@ -665,9 +670,17 @@ async fn main() -> Result<()> {
             // Setup AGENTS.md
             let agents_md_path = Path::new("AGENTS.md");
             if !agents_md_path.exists() {
-                let agents_content = format!(r#"# Mandrid Memory Agent Instructions
-Your role: **{}**
-Run `mem context` to start.
+                let agents_content = format!(r#"# Mandrid Agent Guide
+You are an AI agent operating in a terminal environment. Mandrid (`mem`) is your local memory layer.
+
+## How to use Mandrid:
+1. **Bootstrap Context:** Always start by running `mem context`. This gives you the project role, active tasks, reasoning history, and recent failures.
+2. **Memory Retrieval:** When you need to understand code or find specific logic, use `mem ask "your question" --rerank`.
+3. **Reasoning Persistence:** Before taking a major action, use `mem think "your plan"` to store your reasoning.
+4. **Impact Analysis:** Before changing a function, use `mem impact <symbol_name>` to see what else might break.
+5. **Episodic Capture:** For complex multi-step commands, wrap them in `mem run -- <command>` to ensure the output and success/failure are remembered.
+
+Your current assigned role: **{}**
 "#, role);
                 fs::write(agents_md_path, agents_content)?;
             }

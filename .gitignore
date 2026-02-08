@@ -22,6 +22,7 @@ bin/
 # Local caches
 .mem_cache/
 .mem_models/
+result
 
 # Secrets
 .env

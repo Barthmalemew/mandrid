@@ -69,6 +69,9 @@ mem pack "<prompt>" --type-caps trace=2,thought=1,task=2,auto=2
 
 # Or set a default caps policy
 export MEM_PACK_TYPE_CAPS="trace=2,thought=1,task=2,auto=2"
+
+# Only include active tasks
+mem pack "<prompt>" --task-status active
 ```
 
 4. **Enable automated capture (Shell Hook):**

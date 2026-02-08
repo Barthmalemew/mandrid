@@ -65,6 +65,14 @@ enum AskScope {
 }
 
 #[derive(ValueEnum, Clone, Debug)]
+enum TaskStatusFilter {
+    Any,
+    Active,
+    Pending,
+    Completed,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
 enum AutoEvent {
     GitCommit,
     Command,
@@ -396,6 +404,10 @@ enum Command {
         /// Per-type caps for episodic memories (comma-separated, e.g. trace=2,thought=1)
         #[arg(long, value_delimiter = ',', env = "MEM_PACK_TYPE_CAPS")]
         type_caps: Vec<String>,
+
+        /// Filter task memories by status (any, active, pending, completed).
+        #[arg(long, value_enum, default_value = "any")]
+        task_status: TaskStatusFilter,
 
         /// Enable Cross-Encoder reranking (slower; optional).
         #[arg(long)]
@@ -2761,6 +2773,7 @@ Your current assigned role: **{}**
             include_types,
             exclude_types,
             type_caps,
+            task_status,
             rerank,
             vector_only,
             json,
@@ -2873,6 +2886,20 @@ Your current assigned role: **{}**
                     .collect::<Vec<_>>()
                     .join(", ");
                 filter_parts.push(format!("memory_type NOT IN ({})", list));
+            }
+            if !matches!(task_status, TaskStatusFilter::Any) {
+                let status = match task_status {
+                    TaskStatusFilter::Active => "active",
+                    TaskStatusFilter::Pending => "pending",
+                    TaskStatusFilter::Completed => "completed",
+                    TaskStatusFilter::Any => "",
+                };
+                if !status.is_empty() {
+                    filter_parts.push(format!(
+                        "(memory_type != 'task' OR status = '{}')",
+                        status
+                    ));
+                }
             }
             match scope {
                 ContextScope::Session => filter_parts.push(format!(

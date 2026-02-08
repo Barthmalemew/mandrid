@@ -81,7 +81,10 @@ jobs:
 
       - name: Build with Nix (Linux/macOS)
         if: matrix.os != 'windows-latest'
-        run: nix build .#mandrid
+        run: |
+          nix build .#mandrid
+          # Explicitly push to Cachix to bypass GHA cache restoration issues
+          nix path-info --recursive .#mandrid | cachix push mandrid
 
       - name: Build with Cargo (all platforms)
         run: cargo build --locked --release

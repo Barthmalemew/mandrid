@@ -557,9 +557,30 @@ async fn main() -> Result<()> {
                 filter.push_str(&format!(" AND (file_path = '{}' OR memory_type = 'manual' OR memory_type = 'task' OR memory_type = 'thought')", rel_path.display().to_string().replace('\'', "''")));
             }
 
-            let stream = table.query().only_if(filter).limit(limit).execute().await?;
+            // --- IMPROVED: Task-Relevant Context Injection ---
+            // We split the limit: 70% recent, 30% semantically relevant to current goal
+            let recent_limit = (limit as f32 * 0.7) as usize;
+            let semantic_limit = limit - recent_limit;
+
+            let stream = table.query().only_if(filter.clone()).limit(recent_limit).execute().await?;
             let batches: Vec<RecordBatch> = stream.try_collect().await?;
-            let rows = decode_rows(&batches, None)?;
+            let mut rows = decode_rows(&batches, None)?;
+
+            // If we have an active task, pull in semantically relevant historical memories
+            if !active_tasks.is_empty() && semantic_limit > 0 {
+                let mut embedder = init_embedder(cache_dir.clone(), false)?;
+                let task_text = &active_tasks[0].text;
+                let task_vec = embed_prefixed(&mut embedder, "query", task_text)?;
+                
+                // Search for relevant memories that AREN'T already in the recent list
+                let semantic_results = ask_rrf(&table, &task_vec, task_text, semantic_limit + rows.len(), false).await?;
+                for sr in semantic_results {
+                    if !rows.iter().any(|r| r.text == sr.text) && rows.len() < limit {
+                        rows.push(sr);
+                    }
+                }
+            }
+            // ------------------------------------------------
 
             if json {
                 let payload = serde_json::json!({

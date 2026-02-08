@@ -2,8 +2,9 @@ mod db;
 mod chunker;
 mod task;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -12,10 +13,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use fastembed::{TextEmbedding, TextRerank};
 use futures::TryStreamExt;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::index::Index;
 use lancedb::index::scalar::FtsIndexBuilder;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use arrow_array::RecordBatch;
 use ignore::WalkBuilder;
@@ -38,11 +40,15 @@ use tower_http::cors::CorsLayer;
 
 use tokio::sync::Mutex;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use crate::chunker::*;
 use crate::db::*;
 use crate::task::*;
 
 const DEFAULT_DB_DIR: &str = ".mem_db";
+const AUTO_DIR_NAME: &str = ".mem_auto";
 
 #[derive(ValueEnum, Clone, Debug)]
 enum ContextScope {
@@ -55,6 +61,13 @@ enum AskScope {
     All,
     Code,
     Episodic,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum AutoEvent {
+    GitCommit,
+    Command,
+    FileChange,
 }
 
 fn find_project_root() -> Option<PathBuf> {
@@ -418,6 +431,12 @@ enum Command {
         shell: String,
     },
 
+    /// Deterministic auto-memory (LLM-free).
+    Auto {
+        #[command(subcommand)]
+        subcommand: AutoCommand,
+    },
+
     /// Propose a fix for the most recent failure in memory.
     Fix {
         #[arg(long)]
@@ -466,6 +485,86 @@ enum Command {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum AutoCommand {
+    /// Initialize deterministic auto-memory config and queue.
+    Init {
+        /// Overwrite existing config if present.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Run an auto-memory event and queue/approve the entry.
+    Run {
+        #[arg(long, value_enum)]
+        event: AutoEvent,
+
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Command string for command events.
+        #[arg(long)]
+        cmd: Option<String>,
+
+        /// Exit status for command events.
+        #[arg(long)]
+        status: Option<i32>,
+
+        /// Duration in milliseconds for command events.
+        #[arg(long)]
+        duration_ms: Option<u64>,
+
+        /// Optional note for command events.
+        #[arg(long)]
+        note: Option<String>,
+
+        /// Commit hash for git_commit events (default: HEAD).
+        #[arg(long)]
+        commit: Option<String>,
+
+        /// Paths for file_change events.
+        #[arg(long)]
+        paths: Vec<PathBuf>,
+    },
+
+    /// Show pending auto-memory entries.
+    Status,
+
+    /// Approve queued auto-memory entries.
+    Approve {
+        /// Approve all queued entries.
+        #[arg(long)]
+        all: bool,
+
+        /// Approve a specific entry by id.
+        #[arg(long)]
+        id: Option<String>,
+    },
+
+    /// Reject queued auto-memory entries.
+    Reject {
+        /// Reject all queued entries.
+        #[arg(long)]
+        all: bool,
+
+        /// Reject a specific entry by id.
+        #[arg(long)]
+        id: Option<String>,
+    },
+
+    /// Install or remove auto-memory hooks.
+    Hook {
+        #[arg(value_enum)]
+        action: AutoHookAction,
+    },
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum AutoHookAction {
+    Install,
+    Uninstall,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct PackJsonItem {
     tag: Option<String>,
@@ -507,6 +606,147 @@ struct AskJsonResult {
 struct AskJsonPayload {
     question: String,
     results: Vec<AskJsonResult>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
+struct AutoConfig {
+    filters: AutoFilters,
+    ttl: AutoTtl,
+    review: AutoReview,
+}
+
+impl Default for AutoConfig {
+    fn default() -> Self {
+        Self {
+            filters: AutoFilters::default(),
+            ttl: AutoTtl::default(),
+            review: AutoReview::default(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
+struct AutoFilters {
+    include_paths: Vec<String>,
+    exclude_paths: Vec<String>,
+    include_commands: Vec<String>,
+    max_file_kb: u64,
+    max_diff_lines: u64,
+}
+
+impl Default for AutoFilters {
+    fn default() -> Self {
+        Self {
+            include_paths: Vec::new(),
+            exclude_paths: vec![
+                "target/**".to_string(),
+                ".mem_db/**".to_string(),
+                ".mem_auto/**".to_string(),
+                "node_modules/**".to_string(),
+                "Cargo.lock".to_string(),
+            ],
+            include_commands: vec![
+                "cargo check".to_string(),
+                "cargo test".to_string(),
+                "cargo build".to_string(),
+                "nix develop".to_string(),
+                "npm test".to_string(),
+                "pnpm test".to_string(),
+                "go test".to_string(),
+            ],
+            max_file_kb: 256,
+            max_diff_lines: 500,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
+struct AutoTtl {
+    default_days: u64,
+    promote_on_reference: bool,
+}
+
+impl Default for AutoTtl {
+    fn default() -> Self {
+        Self {
+            default_days: 30,
+            promote_on_reference: true,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
+struct AutoReview {
+    auto_approve: bool,
+}
+
+impl Default for AutoReview {
+    fn default() -> Self {
+        Self { auto_approve: false }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct AutoFact {
+    key: String,
+    value: String,
+    path: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct AutoDiffStats {
+    added: u64,
+    deleted: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
+struct AutoProvenance {
+    git: Option<AutoGitProvenance>,
+    command: Option<AutoCommandProvenance>,
+    file_change: Option<AutoFileChangeProvenance>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct AutoGitProvenance {
+    commit: String,
+    branch: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct AutoCommandProvenance {
+    cmd: String,
+    status: i32,
+    duration_ms: Option<u64>,
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct AutoFileChangeProvenance {
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct AutoEntry {
+    id: String,
+    entry_type: String,
+    source: String,
+    project_id: String,
+    host: String,
+    session: String,
+    timestamp: u64,
+    summary: String,
+    facts: Vec<AutoFact>,
+    paths: Vec<String>,
+    diff_stats: Option<AutoDiffStats>,
+    ttl_days: u64,
+    importance: f32,
+    approved: bool,
+    provenance: AutoProvenance,
 }
 
 #[derive(Clone)]
@@ -603,6 +843,728 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     }
     out.push_str("...");
     out
+}
+
+fn auto_dir(project_root: &Path) -> PathBuf {
+    project_root.join(AUTO_DIR_NAME)
+}
+
+fn auto_config_path(project_root: &Path) -> PathBuf {
+    auto_dir(project_root).join("config.toml")
+}
+
+fn auto_queue_path(project_root: &Path) -> PathBuf {
+    auto_dir(project_root).join("queue.jsonl")
+}
+
+fn auto_gitignore_path(project_root: &Path) -> PathBuf {
+    auto_dir(project_root).join(".gitignore")
+}
+
+fn ensure_auto_dir(project_root: &Path) -> Result<PathBuf> {
+    let dir = auto_dir(project_root);
+    if !dir.exists() {
+        fs::create_dir_all(&dir)?;
+    }
+    Ok(dir)
+}
+
+fn load_auto_config(project_root: &Path) -> Result<AutoConfig> {
+    let path = auto_config_path(project_root);
+    if !path.exists() {
+        return Ok(AutoConfig::default());
+    }
+    let raw = fs::read_to_string(&path)?;
+    let parsed: AutoConfig = toml::from_str(&raw)?;
+    Ok(parsed)
+}
+
+fn write_auto_config(project_root: &Path, config: &AutoConfig) -> Result<()> {
+    let path = auto_config_path(project_root);
+    let body = toml::to_string_pretty(config)?;
+    fs::write(path, body)?;
+    Ok(())
+}
+
+fn load_auto_queue(project_root: &Path) -> Result<Vec<AutoEntry>> {
+    let path = auto_queue_path(project_root);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<AutoEntry>(&line) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+fn write_auto_queue(project_root: &Path, entries: &[AutoEntry]) -> Result<()> {
+    let path = auto_queue_path(project_root);
+    let mut file = fs::File::create(path)?;
+    for entry in entries {
+        let line = serde_json::to_string(entry)?;
+        writeln!(file, "{}", line)?;
+    }
+    Ok(())
+}
+
+fn append_auto_queue(project_root: &Path, entry: &AutoEntry) -> Result<()> {
+    let path = auto_queue_path(project_root);
+    let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let line = serde_json::to_string(entry)?;
+    writeln!(file, "{}", line)?;
+    Ok(())
+}
+
+fn build_globset(patterns: &[String]) -> Result<Option<GlobSet>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = GlobSetBuilder::new();
+    for p in patterns {
+        builder.add(Glob::new(p)?);
+    }
+    Ok(Some(builder.build()?))
+}
+
+fn path_allowed(path: &Path, include: Option<&GlobSet>, exclude: Option<&GlobSet>) -> bool {
+    if let Some(ex) = exclude {
+        if ex.is_match(path) {
+            return false;
+        }
+    }
+    if let Some(inc) = include {
+        return inc.is_match(path);
+    }
+    true
+}
+
+fn command_allowed(cmd: &str, include: &[String]) -> bool {
+    if include.is_empty() {
+        return true;
+    }
+    let trimmed = cmd.trim_start();
+    include.iter().any(|p| trimmed.starts_with(p))
+}
+
+fn get_project_id(project_root: &Path) -> String {
+    let id_path = project_root.join(".mandrid_id");
+    if let Ok(raw) = fs::read_to_string(id_path) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+fn make_auto_entry_id(prefix: &str, seed: &str, timestamp: u64) -> String {
+    let mut clean_seed: String = seed.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if clean_seed.is_empty() {
+        clean_seed = "entry".to_string();
+    }
+    if clean_seed.len() > 12 {
+        clean_seed.truncate(12);
+    }
+    format!("auto-{}-{}-{}", prefix, timestamp, clean_seed)
+}
+
+fn format_auto_entry_text(entry: &AutoEntry) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Auto memory ({})\n", entry.source));
+    out.push_str(&format!("Summary: {}\n", entry.summary));
+    if let Some(stats) = entry.diff_stats.as_ref() {
+        out.push_str(&format!("Diff: +{} -{}\n", stats.added, stats.deleted));
+    }
+    if !entry.paths.is_empty() {
+        out.push_str("Paths:\n");
+        let max_paths = 12;
+        for path in entry.paths.iter().take(max_paths) {
+            out.push_str(&format!("- {}\n", path));
+        }
+        if entry.paths.len() > max_paths {
+            out.push_str(&format!("... ({} more)\n", entry.paths.len() - max_paths));
+        }
+    }
+    if !entry.facts.is_empty() {
+        out.push_str("Facts:\n");
+        for fact in &entry.facts {
+            if let Some(path) = &fact.path {
+                out.push_str(&format!("- {}: {} ({})\n", fact.key, fact.value, path));
+            } else {
+                out.push_str(&format!("- {}: {}\n", fact.key, fact.value));
+            }
+        }
+    }
+    if let Some(git) = &entry.provenance.git {
+        out.push_str(&format!("Commit: {} ({})\n", git.commit, git.branch));
+    }
+    if let Some(cmd) = &entry.provenance.command {
+        out.push_str(&format!("Command: {} (status {})\n", cmd.cmd, cmd.status));
+    }
+    out.trim_end().to_string()
+}
+
+fn auto_entry_name(entry: &AutoEntry) -> String {
+    if let Some(git) = &entry.provenance.git {
+        return git.commit.chars().take(8).collect();
+    }
+    if let Some(cmd) = &entry.provenance.command {
+        return cmd
+            .cmd
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
+    }
+    "".to_string()
+}
+
+fn auto_entry_file_path(entry: &AutoEntry) -> String {
+    if entry.paths.len() == 1 {
+        return entry.paths[0].clone();
+    }
+    "auto".to_string()
+}
+
+async fn run_git(project_root: &Path, args: Vec<String>) -> Result<String> {
+    let output = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(project_root)
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!("git command failed: {}", stderr);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn parse_numstat(output: &str) -> (u64, u64) {
+    let mut added = 0u64;
+    let mut deleted = 0u64;
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        if parts[0] != "-" {
+            added += parts[0].parse::<u64>().unwrap_or(0);
+        }
+        if parts[1] != "-" {
+            deleted += parts[1].parse::<u64>().unwrap_or(0);
+        }
+    }
+    (added, deleted)
+}
+
+fn extract_quoted_value(line: &str) -> Option<String> {
+    let start = line.find('"')?;
+    let rest = &line[start + 1..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn parse_version_from_diff(diff: &str) -> Option<String> {
+    for line in diff.lines() {
+        if !line.starts_with('+') || line.starts_with("+++") {
+            continue;
+        }
+        let trimmed = line.trim_start_matches('+').trim();
+        if trimmed.starts_with("version") || trimmed.starts_with("\"version\"") {
+            if let Some(value) = extract_quoted_value(trimmed) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+async fn detect_version_from_diff(
+    project_root: &Path,
+    commit: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    let diff = run_git(
+        project_root,
+        vec![
+            "show".to_string(),
+            "-1".to_string(),
+            "--unified=0".to_string(),
+            commit.to_string(),
+            "--".to_string(),
+            path.to_string(),
+        ],
+    )
+    .await;
+    if let Ok(diff) = diff {
+        return Ok(parse_version_from_diff(&diff));
+    }
+    Ok(None)
+}
+
+async fn build_git_commit_entry(
+    project_root: &Path,
+    config: &AutoConfig,
+    session_id: &str,
+    commit_override: Option<String>,
+) -> Result<Option<AutoEntry>> {
+    let commit = commit_override.unwrap_or_else(|| "HEAD".to_string());
+    let full_hash = run_git(project_root, vec!["rev-parse".to_string(), commit.clone()])
+        .await?
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if full_hash.is_empty() {
+        return Ok(None);
+    }
+    let short_hash: String = full_hash.chars().take(8).collect();
+    let show = run_git(
+        project_root,
+        vec![
+            "show".to_string(),
+            "-1".to_string(),
+            "--name-status".to_string(),
+            "--pretty=format:%ct%n%s".to_string(),
+            commit.clone(),
+        ],
+    )
+    .await?;
+
+    let mut lines = show.lines();
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+    let timestamp = lines
+        .next()
+        .and_then(|l| l.trim().parse::<u64>().ok())
+        .unwrap_or(now);
+    let subject = lines.next().unwrap_or("commit").trim().to_string();
+
+    let mut raw_paths = Vec::new();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let status = parts[0];
+        let path = if status.starts_with('R') && parts.len() >= 3 {
+            parts[2]
+        } else if parts.len() >= 2 {
+            parts[1]
+        } else {
+            continue;
+        };
+        raw_paths.push(path.to_string());
+    }
+
+    if raw_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let include = build_globset(&config.filters.include_paths)?;
+    let exclude = build_globset(&config.filters.exclude_paths)?;
+
+    let mut filtered_paths = Vec::new();
+    for path in raw_paths {
+        let rel = PathBuf::from(&path);
+        if path_allowed(&rel, include.as_ref(), exclude.as_ref()) {
+            filtered_paths.push(path);
+        }
+    }
+
+    if filtered_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let mut final_paths = Vec::new();
+    for path in filtered_paths {
+        let full = project_root.join(&path);
+        if full.exists() {
+            if let Ok(meta) = fs::metadata(&full) {
+                let size_kb = meta.len() / 1024;
+                if config.filters.max_file_kb > 0 && size_kb > config.filters.max_file_kb {
+                    continue;
+                }
+            }
+        }
+        final_paths.push(path);
+    }
+
+    if final_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let numstat = run_git(
+        project_root,
+        vec![
+            "show".to_string(),
+            "-1".to_string(),
+            "--numstat".to_string(),
+            "--pretty=format:".to_string(),
+            commit.clone(),
+        ],
+    )
+    .await?
+    .to_string();
+    let (added, deleted) = parse_numstat(&numstat);
+    if config.filters.max_diff_lines > 0 && added + deleted > config.filters.max_diff_lines {
+        return Ok(None);
+    }
+
+    let mut facts = vec![
+        AutoFact {
+            key: "commit".to_string(),
+            value: short_hash.clone(),
+            path: None,
+        },
+        AutoFact {
+            key: "files_changed".to_string(),
+            value: final_paths.len().to_string(),
+            path: None,
+        },
+    ];
+    if added + deleted > 0 {
+        facts.push(AutoFact {
+            key: "diff".to_string(),
+            value: format!("+{} -{}", added, deleted),
+            path: None,
+        });
+    }
+
+    if final_paths.iter().any(|p| p == "Cargo.toml") {
+        if let Ok(Some(version)) = detect_version_from_diff(project_root, &commit, "Cargo.toml").await {
+            facts.push(AutoFact {
+                key: "version".to_string(),
+                value: version,
+                path: Some("Cargo.toml".to_string()),
+            });
+        }
+    }
+    if final_paths.iter().any(|p| p == "package.json") {
+        if let Ok(Some(version)) = detect_version_from_diff(project_root, &commit, "package.json").await {
+            facts.push(AutoFact {
+                key: "version".to_string(),
+                value: version,
+                path: Some("package.json".to_string()),
+            });
+        }
+    }
+
+    let summary = format!(
+        "{} ({}) | files: {} | diff: +{} -{}",
+        subject,
+        short_hash,
+        final_paths.len(),
+        added,
+        deleted
+    );
+
+    let mut importance = 0.4;
+    if final_paths.iter().any(|p| {
+        p.ends_with("Cargo.toml")
+            || p.ends_with("package.json")
+            || p.ends_with("flake.nix")
+            || p.ends_with("go.mod")
+            || p.ends_with("pyproject.toml")
+    }) {
+        importance += 0.3;
+    }
+    if added + deleted >= 200 {
+        importance += 0.2;
+    }
+    if final_paths.len() >= 10 {
+        importance += 0.1;
+    }
+    if importance > 1.0 {
+        importance = 1.0;
+    }
+
+    let branch = run_git(
+        project_root,
+        vec![
+            "rev-parse".to_string(),
+            "--abbrev-ref".to_string(),
+            "HEAD".to_string(),
+        ],
+    )
+    .await
+    .ok()
+    .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
+    .unwrap_or_else(|| "unknown".to_string());
+
+    Ok(Some(AutoEntry {
+        id: make_auto_entry_id("git", &short_hash, timestamp),
+        entry_type: "auto".to_string(),
+        source: "git_commit".to_string(),
+        project_id: get_project_id(project_root),
+        host: get_hostname(),
+        session: session_id.to_string(),
+        timestamp,
+        summary,
+        facts,
+        paths: final_paths,
+        diff_stats: Some(AutoDiffStats { added, deleted }),
+        ttl_days: config.ttl.default_days,
+        importance,
+        approved: false,
+        provenance: AutoProvenance {
+            git: Some(AutoGitProvenance {
+                commit: full_hash,
+                branch,
+            }),
+            command: None,
+            file_change: None,
+        },
+    }))
+}
+
+fn build_command_entry(
+    project_root: &Path,
+    config: &AutoConfig,
+    session_id: &str,
+    cmd: String,
+    status: i32,
+    duration_ms: Option<u64>,
+    note: Option<String>,
+) -> Result<Option<AutoEntry>> {
+    let cmd_trimmed = cmd.trim();
+    if cmd_trimmed.is_empty() {
+        return Ok(None);
+    }
+    if !command_allowed(cmd_trimmed, &config.filters.include_commands) {
+        return Ok(None);
+    }
+
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+    let mut facts = vec![
+        AutoFact {
+            key: "command".to_string(),
+            value: cmd_trimmed.to_string(),
+            path: None,
+        },
+        AutoFact {
+            key: "status".to_string(),
+            value: status.to_string(),
+            path: None,
+        },
+    ];
+    if let Some(duration) = duration_ms {
+        facts.push(AutoFact {
+            key: "duration_ms".to_string(),
+            value: duration.to_string(),
+            path: None,
+        });
+    }
+
+    let mut importance = 0.4;
+    let cmd_lower = cmd_trimmed.to_lowercase();
+    if cmd_lower.contains("test") || cmd_lower.contains("check") {
+        importance += 0.2;
+    }
+    if status != 0 {
+        importance += 0.2;
+    }
+    if importance > 1.0 {
+        importance = 1.0;
+    }
+
+    let summary = if let Some(duration) = duration_ms {
+        format!("{} | status: {} | {}ms", cmd_trimmed, status, duration)
+    } else {
+        format!("{} | status: {}", cmd_trimmed, status)
+    };
+
+    Ok(Some(AutoEntry {
+        id: make_auto_entry_id("cmd", cmd_trimmed, now),
+        entry_type: "auto".to_string(),
+        source: "command".to_string(),
+        project_id: get_project_id(project_root),
+        host: get_hostname(),
+        session: session_id.to_string(),
+        timestamp: now,
+        summary,
+        facts,
+        paths: Vec::new(),
+        diff_stats: None,
+        ttl_days: config.ttl.default_days,
+        importance,
+        approved: false,
+        provenance: AutoProvenance {
+            git: None,
+            command: Some(AutoCommandProvenance {
+                cmd: cmd_trimmed.to_string(),
+                status,
+                duration_ms,
+                note,
+            }),
+            file_change: None,
+        },
+    }))
+}
+
+fn build_file_change_entry(
+    project_root: &Path,
+    config: &AutoConfig,
+    session_id: &str,
+    paths: Vec<PathBuf>,
+) -> Result<Option<AutoEntry>> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+
+    let include = build_globset(&config.filters.include_paths)?;
+    let exclude = build_globset(&config.filters.exclude_paths)?;
+
+    let mut final_paths = Vec::new();
+    for path in paths {
+        let abs = fs::canonicalize(&path).unwrap_or(path);
+        let rel = abs.strip_prefix(project_root).unwrap_or(&abs);
+        let rel_path = PathBuf::from(rel);
+        if !path_allowed(&rel_path, include.as_ref(), exclude.as_ref()) {
+            continue;
+        }
+        if let Ok(meta) = fs::metadata(&abs) {
+            let size_kb = meta.len() / 1024;
+            if config.filters.max_file_kb > 0 && size_kb > config.filters.max_file_kb {
+                continue;
+            }
+        }
+        final_paths.push(rel_path.to_string_lossy().to_string());
+    }
+
+    if final_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+    let summary = format!("File changes: {} paths", final_paths.len());
+    let facts = vec![AutoFact {
+        key: "files_changed".to_string(),
+        value: final_paths.len().to_string(),
+        path: None,
+    }];
+
+    Ok(Some(AutoEntry {
+        id: make_auto_entry_id("file", &final_paths[0], now),
+        entry_type: "auto".to_string(),
+        source: "file_change".to_string(),
+        project_id: get_project_id(project_root),
+        host: get_hostname(),
+        session: session_id.to_string(),
+        timestamp: now,
+        summary,
+        facts,
+        paths: final_paths.clone(),
+        diff_stats: None,
+        ttl_days: config.ttl.default_days,
+        importance: 0.3,
+        approved: false,
+        provenance: AutoProvenance {
+            git: None,
+            command: None,
+            file_change: Some(AutoFileChangeProvenance { paths: final_paths }),
+        },
+    }))
+}
+
+async fn store_auto_entries(
+    db_path: &Path,
+    cache_dir: Option<PathBuf>,
+    entries: &[AutoEntry],
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let table = open_or_create_table(db_path).await?;
+    let mut embedder = init_embedder(cache_dir, false)?;
+    let mut rows = Vec::new();
+    for entry in entries {
+        let text = format_auto_entry_text(entry);
+        let embedding = embed_prefixed(&mut embedder, "passage", &text)?;
+        let row = MemoryRow {
+            vector: embedding,
+            text,
+            tag: get_origin_tag(&format!("auto:{}", entry.source)),
+            memory_type: "auto".to_string(),
+            file_path: auto_entry_file_path(entry),
+            line_start: 0,
+            session_id: entry.session.clone(),
+            name: auto_entry_name(entry),
+            references: serde_json::to_string(&entry.paths).unwrap_or_else(|_| "[]".to_string()),
+            depends_on: "[]".to_string(),
+            status: "active".to_string(),
+            mtime_secs: 0,
+            size_bytes: 0,
+            created_at: entry.timestamp,
+        };
+        rows.push(row);
+    }
+    add_rows(&table, rows).await?;
+    Ok(())
+}
+
+fn auto_hook_script() -> String {
+    "#!/bin/sh\n# mandrid-auto-hook\nif command -v mem >/dev/null 2>&1; then\n  mem auto run --event git_commit >/dev/null 2>&1\nfi\n".to_string()
+}
+
+fn install_auto_git_hook(project_root: &Path) -> Result<()> {
+    let git_dir = project_root.join(".git");
+    if !git_dir.exists() {
+        anyhow::bail!("No .git directory found. Auto hook requires a git repository.");
+    }
+    let hook_path = git_dir.join("hooks/post-commit");
+    if hook_path.exists() {
+        let existing = fs::read_to_string(&hook_path).unwrap_or_default();
+        if existing.contains("mandrid-auto-hook") {
+            println!("Auto hook already installed: {}", hook_path.display());
+            return Ok(());
+        }
+        anyhow::bail!(
+            "Hook already exists at {}. Remove or edit it to install Mandrid auto hook.",
+            hook_path.display()
+        );
+    }
+    let script = auto_hook_script();
+    fs::write(&hook_path, script)?;
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&hook_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&hook_path, perms)?;
+    }
+    println!("Installed git post-commit hook at {}", hook_path.display());
+    Ok(())
+}
+
+fn uninstall_auto_git_hook(project_root: &Path) -> Result<()> {
+    let hook_path = project_root.join(".git/hooks/post-commit");
+    if !hook_path.exists() {
+        println!("No post-commit hook found.");
+        return Ok(());
+    }
+    let existing = fs::read_to_string(&hook_path).unwrap_or_default();
+    if existing.contains("mandrid-auto-hook") {
+        fs::remove_file(&hook_path)?;
+        println!("Removed auto hook from {}", hook_path.display());
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Post-commit hook at {} does not look like a Mandrid auto hook.",
+        hook_path.display()
+    );
 }
 
 fn scope_to_str(scope: &ContextScope) -> &'static str {
@@ -1713,7 +2675,7 @@ Your current assigned role: **{}**
                 None
             };
 
-            let episodic_rows: Vec<DecodedRow> = if k_episodic == 0 {
+            let mut episodic_rows: Vec<DecodedRow> = if k_episodic == 0 {
                 Vec::new()
             } else if let Some(ref mut rr) = reranker {
                 ask_hybrid_with_reranker(
@@ -1738,7 +2700,7 @@ Your current assigned role: **{}**
                 .await?
             };
 
-            let code_rows: Vec<DecodedRow> = if include_code && k_code > 0 {
+            let mut code_rows: Vec<DecodedRow> = if include_code && k_code > 0 {
                 let code_filter = "memory_type = 'code'";
                 if let Some(ref mut rr) = reranker {
                     ask_hybrid_with_reranker(
@@ -1765,6 +2727,30 @@ Your current assigned role: **{}**
             } else {
                 Vec::new()
             };
+
+            if !episodic_rows.is_empty() {
+                let mut seen = HashSet::new();
+                let mut deduped = Vec::with_capacity(episodic_rows.len());
+                for row in episodic_rows.into_iter() {
+                    let key = format!("{}:{}", row.memory_type, row.text);
+                    if seen.insert(key) {
+                        deduped.push(row);
+                    }
+                }
+                episodic_rows = deduped;
+            }
+
+            if !code_rows.is_empty() {
+                let mut seen = HashSet::new();
+                let mut deduped = Vec::with_capacity(code_rows.len());
+                for row in code_rows.into_iter() {
+                    let key = format!("{}:{}:{}", row.file_path, row.line_start, row.text);
+                    if seen.insert(key) {
+                        deduped.push(row);
+                    }
+                }
+                code_rows = deduped;
+            }
 
             let pack = build_pack_text(
                 &role,
@@ -2510,6 +3496,171 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
                 anyhow::bail!("Unsupported shell: {}", shell);
             }
         }
+        Command::Auto { subcommand } => {
+            match subcommand {
+                AutoCommand::Init { force } => {
+                    let auto_path = ensure_auto_dir(&project_root)?;
+                    let config_path = auto_config_path(&project_root);
+                    if config_path.exists() && !force {
+                        println!("Auto config already exists at {}", config_path.display());
+                    } else {
+                        write_auto_config(&project_root, &AutoConfig::default())?;
+                        println!("Wrote auto config to {}", config_path.display());
+                    }
+
+                    let gitignore_path = auto_gitignore_path(&project_root);
+                    let mut ignore_content = if gitignore_path.exists() {
+                        fs::read_to_string(&gitignore_path).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    if !ignore_content.contains("queue.jsonl") {
+                        if !ignore_content.ends_with('\n') && !ignore_content.is_empty() {
+                            ignore_content.push('\n');
+                        }
+                        ignore_content.push_str("queue.jsonl\n");
+                        fs::write(&gitignore_path, ignore_content)?;
+                    }
+
+                    println!("Auto memory initialized at {}", auto_path.display());
+                }
+                AutoCommand::Run {
+                    event,
+                    session,
+                    cmd,
+                    status,
+                    duration_ms,
+                    note,
+                    commit,
+                    paths,
+                } => {
+                    let _ = ensure_auto_dir(&project_root)?;
+                    let config = load_auto_config(&project_root)?;
+                    let session_id = session.unwrap_or_else(|| "default".to_string());
+
+                    let entry = match event {
+                        AutoEvent::GitCommit => {
+                            build_git_commit_entry(&project_root, &config, &session_id, commit)
+                                .await?
+                        }
+                        AutoEvent::Command => {
+                            let cmd = cmd.ok_or_else(|| anyhow::anyhow!("--cmd is required for command events"))?;
+                            let status = status.unwrap_or(0);
+                            build_command_entry(
+                                &project_root,
+                                &config,
+                                &session_id,
+                                cmd,
+                                status,
+                                duration_ms,
+                                note,
+                            )?
+                        }
+                        AutoEvent::FileChange => {
+                            build_file_change_entry(&project_root, &config, &session_id, paths)?
+                        }
+                    };
+
+                    if let Some(entry) = entry {
+                        if config.review.auto_approve {
+                            store_auto_entries(&db_path, cache_dir.clone(), &[entry]).await?;
+                            println!("Auto memory saved.");
+                        } else {
+                            append_auto_queue(&project_root, &entry)?;
+                            println!("Auto memory queued. Use `mem auto approve` to persist.");
+                        }
+                    } else {
+                        println!("No auto memory generated.");
+                    }
+                }
+                AutoCommand::Status => {
+                    let entries = load_auto_queue(&project_root)?;
+                    println!("Pending auto memories: {}", entries.len());
+                    for entry in entries.iter().take(5) {
+                        println!("- {} | {}", entry.id, entry.summary);
+                    }
+                }
+                AutoCommand::Approve { all, id } => {
+                    let mut entries = load_auto_queue(&project_root)?;
+                    if entries.is_empty() {
+                        println!("No queued auto memories.");
+                        return Ok(());
+                    }
+                    if !all && id.is_none() {
+                        println!("Queued auto memories:");
+                        for entry in &entries {
+                            println!("- {} | {}", entry.id, entry.summary);
+                        }
+                        println!("Use --all or --id to approve.");
+                        return Ok(());
+                    }
+
+                    let mut approved = Vec::new();
+                    let mut remaining = Vec::new();
+                    for entry in entries.drain(..) {
+                        let matches = if all {
+                            true
+                        } else if let Some(ref target) = id {
+                            entry.id == *target
+                        } else {
+                            false
+                        };
+                        if matches {
+                            approved.push(entry);
+                        } else {
+                            remaining.push(entry);
+                        }
+                    }
+
+                    if approved.is_empty() {
+                        println!("No matching entries found.");
+                        return Ok(());
+                    }
+
+                    store_auto_entries(&db_path, cache_dir.clone(), &approved).await?;
+                    write_auto_queue(&project_root, &remaining)?;
+                    println!("Approved {} auto memories.", approved.len());
+                }
+                AutoCommand::Reject { all, id } => {
+                    let mut entries = load_auto_queue(&project_root)?;
+                    if entries.is_empty() {
+                        println!("No queued auto memories.");
+                        return Ok(());
+                    }
+                    if !all && id.is_none() {
+                        println!("Queued auto memories:");
+                        for entry in &entries {
+                            println!("- {} | {}", entry.id, entry.summary);
+                        }
+                        println!("Use --all or --id to reject.");
+                        return Ok(());
+                    }
+
+                    let mut remaining = Vec::new();
+                    let mut rejected = 0usize;
+                    for entry in entries.drain(..) {
+                        let matches = if all {
+                            true
+                        } else if let Some(ref target) = id {
+                            entry.id == *target
+                        } else {
+                            false
+                        };
+                        if matches {
+                            rejected += 1;
+                        } else {
+                            remaining.push(entry);
+                        }
+                    }
+                    write_auto_queue(&project_root, &remaining)?;
+                    println!("Rejected {} auto memories.", rejected);
+                }
+                AutoCommand::Hook { action } => match action {
+                    AutoHookAction::Install => install_auto_git_hook(&project_root)?,
+                    AutoHookAction::Uninstall => uninstall_auto_git_hook(&project_root)?,
+                },
+            }
+        }
         Command::Watch { root_dir } => {
             let (tx, rx) = channel();
             let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
@@ -2767,10 +3918,11 @@ You are equipped with Mandrid, a local persistent memory layer. Use these tools 
  - `mem impact <symbol>`: Deterministic blast-radius analysis. See who calls this function/struct.
  - `mem why <symbol>`: Attribution. See the reasoning traces captured when this symbol was last modified.
 
-## Capture
-- `mem think "<reasoning>"`: **PROACTIVE**. Store your plan before acting.
-- `mem run -- <command>`: **CRITICAL**. Run terminal commands through this to record success/failure and output.
-- `mem capture "<summary>"`: Permanent record of changes and reasoning.
+ ## Capture
+ - `mem think "<reasoning>"`: **PROACTIVE**. Store your plan before acting.
+ - `mem run -- <command>`: **CRITICAL**. Run terminal commands through this to record success/failure and output.
+ - `mem capture "<summary>"`: Permanent record of changes and reasoning.
+ - `mem auto <subcommand>`: Deterministic auto-memory from git/command events (LLM-free).
 
  ## Maintenance
  - `mem rebuild`: Rebuild the local DB after significant Mandrid updates (backs up `.mem_db`, regenerates it).
@@ -2796,10 +3948,11 @@ You are equipped with Mandrid, a local persistent memory layer. Use these tools 
                          { "name": "mem context", "description": "Retrieve project state, tasks, and recent failures." },
                          { "name": "mem ask", "description": "Search code and reasoning history." },
                          { "name": "mem impact", "description": "Graph-based dependency analysis." },
-                         { "name": "mem think", "description": "Persist internal reasoning." },
-                         { "name": "mem run", "description": "Execute terminal commands with telemetry capture." },
-                        { "name": "mem rebuild", "description": "Rebuild the local DB after a Mandrid update." },
-                        { "name": "mem doctor", "description": "Diagnose DB health/version and show backups." }
+                          { "name": "mem think", "description": "Persist internal reasoning." },
+                          { "name": "mem run", "description": "Execute terminal commands with telemetry capture." },
+                          { "name": "mem auto", "description": "Deterministic auto-memory from git/command events." },
+                         { "name": "mem rebuild", "description": "Rebuild the local DB after a Mandrid update." },
+                         { "name": "mem doctor", "description": "Diagnose DB health/version and show backups." }
                      ]
                  });
                 println!("{}", serde_json::to_string_pretty(&schema)?);

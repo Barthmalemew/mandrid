@@ -17,5 +17,7 @@ Before starting tasks, please verify the memory state.
 ## Tools
 - `mem learn`: Re-indexes the codebase (run this if you suspect the index is stale).
 - `mem capture`: Saves your git diff + reasoning to the permanent record.
+- `mem auto init`: Sets up deterministic auto-memory (LLM-free).
+- `mem auto hook install`: Installs a git hook to queue commit summaries.
 
 Do not edit `.mem_db/` manually.

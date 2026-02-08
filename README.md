@@ -10,6 +10,7 @@ Mandrid provides a persistent context layer for developers and autonomous agents
 - **Hybrid Retrieval:** Combined Vector Search (LanceDB) and Full-Text Search (FTS), optimized with local Cross-Encoder reranking.
 - **Blast Radius Analysis:** Deterministic tracking of symbol relationships to map the impact of code changes.
 - **Episodic Logging:** Automated capture of terminal sessions, including exit codes and execution telemetry.
+- **Deterministic Auto-Memory:** LLM-free summaries from git/command events with reviewable queues.
 - **Proactive Context:** "Negative memory" system that flags previous failures and anti-patterns during active sessions.
 - **Local Runtime:** Zero cloud dependencies. All embeddings and reranking processes run on the local CPU.
 
@@ -56,21 +57,27 @@ Mandrid utilizes `fastembed` for local inference.
    ```
 
 4. **Enable automated capture (Shell Hook):**
-   Add the following to your shell configuration (`.zshrc`, `.bashrc`, or PowerShell `$PROFILE`):
+    Add the following to your shell configuration (`.zshrc`, `.bashrc`, or PowerShell `$PROFILE`):
    ```bash
    # Zsh/Bash
    source <(mem hook zsh) # or bash
    
    # PowerShell
-   Invoke-Expression (& mem hook powershell)
+    Invoke-Expression (& mem hook powershell)
+    ```
+
+5. **Enable deterministic auto-memory (Git Hook):**
+   ```bash
+   mem auto init
+   mem auto hook install
    ```
 
-5. **Query the memory:**
+6. **Query the memory:**
    ```bash
    mem ask "explain the database connection pooling logic" --rerank
    ```
 
-6. **Analyze impact:**
+7. **Analyze impact:**
    ```bash
    mem impact handle_request --depth 2
    ```

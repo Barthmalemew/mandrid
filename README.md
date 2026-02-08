@@ -6,7 +6,7 @@ Mandrid is a persistent memory layer designed to give terminal-based AI agents (
 
 ## 🚀 Key Features
 
-- **Polyglot Structural Engine:** AST-aware chunking for Rust, Python, JavaScript, and TypeScript using Tree-sitter.
+- **Polyglot Structural Engine:** AST-aware chunking for Rust, Python, JavaScript/TypeScript, Go, C/C++, Java, and C# using Tree-sitter.
 - **Hybrid Search + Reranking:** Combines Vector Search (LanceDB) with Full-Text Search (FTS), fused via RRF and polished with a local Cross-Encoder reranker.
 - **Knowledge Graph Intelligence:** Tracks symbol relationships (who calls whom?) to calculate the "Blast Radius" of code changes.
 - **Episodic Capture:** Automatically streams terminal commands, exit codes, and git history into searchable "experience."
@@ -21,9 +21,40 @@ Mandrid is a persistent memory layer designed to give terminal-based AI agents (
 nix profile install github:Barthmalemew/mandrid
 ```
 
+### Prebuilt binaries
+Download the appropriate binary from GitHub Releases and put it on your `PATH`:
+
+- Linux: `mandrid-linux-amd64`
+- macOS: `mandrid-macos-amd64`
+- Windows: `mandrid-windows-amd64.exe`
+
+Releases: https://github.com/Barthmalemew/mandrid/releases
+
+Quick install examples:
+
+```bash
+# Linux/macOS (rename to `mem` and put on PATH)
+chmod +x ./mandrid-<os>-amd64
+sudo mv ./mandrid-<os>-amd64 /usr/local/bin/mem
+```
+
+Windows: rename `mandrid-windows-amd64.exe` to `mem.exe` and add its folder to your user/system `PATH`.
+
+### Runtime dependency: ONNX Runtime
+Mandrid uses local embedding/reranking via `fastembed` (ONNX Runtime).
+
+- Nix installs and wires this up automatically.
+- If you install from source or use a raw release binary outside Nix, you must have the ONNX Runtime shared library available.
+
+Common fixes:
+
+- Linux: install `onnxruntime` (distro package) or place `libonnxruntime.so` on `LD_LIBRARY_PATH`.
+- macOS: install `onnxruntime` (Homebrew) or set `ORT_DYLIB_PATH` to the directory containing `libonnxruntime.dylib`.
+- Windows: ensure `onnxruntime.dll` is on `PATH`.
+
 ### From Source
 ```bash
-cargo install --path .
+cargo install --locked --path .
 ```
 
 ## 🛠 Usage

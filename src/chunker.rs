@@ -243,6 +243,114 @@ impl LanguageParser for TSXParser {
     }
 }
 
+pub struct CParser;
+impl LanguageParser for CParser {
+    fn language(&self) -> Language { tree_sitter_c::LANGUAGE.into() }
+    fn query_source(&self) -> &'static str {
+        r#"
+        (function_definition declarator: (function_declarator declarator: (identifier) @name)) @symbol
+        (struct_specifier name: (type_identifier) @name) @symbol
+        (type_definition declarator: (type_identifier) @name) @symbol
+        "#
+    }
+    fn parse_kind(&self, kind: &str) -> SymbolKind {
+        match kind {
+            "function_definition" => SymbolKind::Function,
+            "struct_specifier" => SymbolKind::Struct,
+            "type_definition" => SymbolKind::Unknown("Typedef".to_string()),
+            _ => SymbolKind::Unknown(kind.to_string()),
+        }
+    }
+}
+
+pub struct CppParser;
+impl LanguageParser for CppParser {
+    fn language(&self) -> Language { tree_sitter_cpp::LANGUAGE.into() }
+    fn query_source(&self) -> &'static str {
+        r#"
+        (function_definition declarator: (function_declarator declarator: (identifier) @name)) @symbol
+        (class_specifier name: (type_identifier) @name) @symbol
+        (struct_specifier name: (type_identifier) @name) @symbol
+        (namespace_definition name: (namespace_identifier) @name) @symbol
+        "#
+    }
+    fn parse_kind(&self, kind: &str) -> SymbolKind {
+        match kind {
+            "function_definition" => SymbolKind::Function,
+            "class_specifier" => SymbolKind::Class,
+            "struct_specifier" => SymbolKind::Struct,
+            "namespace_definition" => SymbolKind::Module,
+            _ => SymbolKind::Unknown(kind.to_string()),
+        }
+    }
+}
+
+pub struct GoParser;
+impl LanguageParser for GoParser {
+    fn language(&self) -> Language { tree_sitter_go::LANGUAGE.into() }
+    fn query_source(&self) -> &'static str {
+        r#"
+        (function_declaration name: (identifier) @name) @symbol
+        (method_declaration name: (field_identifier) @name) @symbol
+        (type_spec name: (type_identifier) @name) @symbol
+        "#
+    }
+    fn parse_kind(&self, kind: &str) -> SymbolKind {
+        match kind {
+            "function_declaration" => SymbolKind::Function,
+            "method_declaration" => SymbolKind::Method,
+            "type_spec" => SymbolKind::Unknown("Type".to_string()),
+            _ => SymbolKind::Unknown(kind.to_string()),
+        }
+    }
+}
+
+pub struct JavaParser;
+impl LanguageParser for JavaParser {
+    fn language(&self) -> Language { tree_sitter_java::LANGUAGE.into() }
+    fn query_source(&self) -> &'static str {
+        r#"
+        (class_declaration name: (identifier) @name) @symbol
+        (interface_declaration name: (identifier) @name) @symbol
+        (method_declaration name: (identifier) @name) @symbol
+        (constructor_declaration name: (identifier) @name) @symbol
+        "#
+    }
+    fn parse_kind(&self, kind: &str) -> SymbolKind {
+        match kind {
+            "class_declaration" => SymbolKind::Class,
+            "interface_declaration" => SymbolKind::Interface,
+            "method_declaration" => SymbolKind::Method,
+            "constructor_declaration" => SymbolKind::Method,
+            _ => SymbolKind::Unknown(kind.to_string()),
+        }
+    }
+}
+
+pub struct CSharpParser;
+impl LanguageParser for CSharpParser {
+    fn language(&self) -> Language { tree_sitter_c_sharp::LANGUAGE.into() }
+    fn query_source(&self) -> &'static str {
+        r#"
+        (namespace_declaration name: (identifier) @name) @symbol
+        (class_declaration name: (identifier) @name) @symbol
+        (struct_declaration name: (identifier) @name) @symbol
+        (interface_declaration name: (identifier) @name) @symbol
+        (method_declaration name: (identifier) @name) @symbol
+        "#
+    }
+    fn parse_kind(&self, kind: &str) -> SymbolKind {
+        match kind {
+            "namespace_declaration" => SymbolKind::Module,
+            "class_declaration" => SymbolKind::Class,
+            "struct_declaration" => SymbolKind::Struct,
+            "interface_declaration" => SymbolKind::Interface,
+            "method_declaration" => SymbolKind::Method,
+            _ => SymbolKind::Unknown(kind.to_string()),
+        }
+    }
+}
+
 pub struct Chunk {
     pub text: String,
     pub line: u32,
@@ -258,6 +366,11 @@ pub fn structural_chunk(content: &str, file_path: &Path) -> Vec<Chunk> {
         "js" | "jsx" => Box::new(JavaScriptParser),
         "ts" => Box::new(TypeScriptParser),
         "tsx" => Box::new(TSXParser),
+        "c" | "h" => Box::new(CParser),
+        "cpp" | "hpp" | "cc" | "cxx" | "hh" | "hxx" => Box::new(CppParser),
+        "go" => Box::new(GoParser),
+        "java" => Box::new(JavaParser),
+        "cs" => Box::new(CSharpParser),
         _ => {
             return chunk_text_line_aware(content, 500, 50)
                 .into_iter()
@@ -326,7 +439,11 @@ pub fn chunk_text_line_aware(text: &str, chunk_size: usize, overlap: usize) -> V
 
 pub fn is_supported_file(path: &Path) -> bool {
     let extensions: HashSet<&'static str> = [
-        "py", "rs", "js", "ts", "jsx", "tsx", "md", "txt", "nix", "go", "c", "cpp", "h", "hpp",
+        "py", "rs", "js", "ts", "jsx", "tsx", "md", "txt", "nix",
+        "go", "c", "h", "cpp", "hpp", "cc", "cxx", "hh", "hxx",
+        "java", "cs",
+        // Shell / scripting (line-aware indexing)
+        "sh", "bash", "zsh",
     ]
     .into_iter()
     .collect();

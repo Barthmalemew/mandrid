@@ -5,14 +5,36 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.1.5)'
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
 
 jobs:
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Mandrid ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+
   publish:
     name: Publish for ${{ matrix.os }}
+    needs: release
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       matrix:
         include:
@@ -26,11 +48,20 @@ jobs:
             artifact_name: mem
             asset_name: mandrid-macos-amd64
 
+    defaults:
+      run:
+        shell: bash
+
     steps:
       - uses: actions/checkout@v4
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: Install protoc
         uses: arduino/setup-protoc@v3
@@ -38,7 +69,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Upload binaries to release
         uses: svenstaro/upload-release-action@v2
@@ -46,7 +77,5 @@ jobs:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: target/release/${{ matrix.artifact_name }}
           asset_name: ${{ matrix.asset_name }}
-          tag: ${{ github.ref }}
+          tag: ${{ env.RELEASE_TAG }}
           overwrite: true
-          release_name: "Mandrid ${{ github.ref_name }}"
-          body: "Automated release for Mandrid ${{ github.ref_name }}"

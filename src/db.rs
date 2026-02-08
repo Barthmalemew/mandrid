@@ -187,39 +187,67 @@ pub async fn ask_hybrid(
     limit: usize,
     cache_dir: Option<PathBuf>,
 ) -> Result<Vec<DecodedRow>> {
-    use lancedb::rerankers::rrf::RRFReranker;
+    let mut reranker = init_reranker(cache_dir, false)?;
+    ask_hybrid_with_reranker(table, query_vector, query_text, limit, &mut reranker).await
+}
+
+pub async fn ask_rrf(
+    table: &lancedb::Table,
+    query_vector: &[f32],
+    query_text: &str,
+    limit: usize,
+    vector_only: bool,
+) -> Result<Vec<DecodedRow>> {
     use lancedb::index::scalar::FullTextSearchQuery;
     use lancedb::query::{ExecutableQuery, QueryBase};
+    use lancedb::rerankers::rrf::RRFReranker;
 
     let query_builder = table.query().nearest_to(query_vector)?;
-    // Fetch 50 results for reranking
-    let stream = query_builder
-        .full_text_search(FullTextSearchQuery::new(query_text.to_owned()))
-        .rerank(Arc::new(RRFReranker::default()))
-        .limit(50)
-        .execute()
-        .await?;
-    
+    let stream = if vector_only {
+        query_builder.limit(limit).execute().await?
+    } else {
+        query_builder
+            .full_text_search(FullTextSearchQuery::new(query_text.to_owned()))
+            .rerank(Arc::new(RRFReranker::default()))
+            .limit(limit)
+            .execute()
+            .await?
+    };
     let batches: Vec<RecordBatch> = stream.try_collect().await?;
-    let results = decode_rows(&batches, None)?;
-    
+    decode_rows(&batches, Some(limit))
+}
+
+pub async fn ask_hybrid_with_reranker(
+    table: &lancedb::Table,
+    query_vector: &[f32],
+    query_text: &str,
+    limit: usize,
+    reranker: &mut TextRerank,
+) -> Result<Vec<DecodedRow>> {
+    // Phase A: Hybrid retrieval (Vector + FTS fused via RRF)
+    let mut results = ask_rrf(table, query_vector, query_text, 50, false).await?;
     if results.is_empty() {
         return Ok(results);
     }
 
-    // Phase B: Reranking
-    let mut reranker = init_reranker(cache_dir, false)?;
+    // Phase B: Cross-encoder reranking
     let documents: Vec<&str> = results.iter().map(|r| r.text.as_str()).collect();
     let reranked = reranker.rerank(query_text, documents.as_slice(), false, None)?;
-    
-    let mut indexed_results: Vec<_> = results.into_iter().enumerate().collect();
+
+    let mut indexed_results: Vec<_> = results.drain(..).enumerate().collect();
     indexed_results.sort_by(|(idx_a, _), (idx_b, _)| {
         let score_a = reranked.get(*idx_a).map(|r| r.score).unwrap_or(0.0);
         let score_b = reranked.get(*idx_b).map(|r| r.score).unwrap_or(0.0);
-        score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+        score_b
+            .partial_cmp(&score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
-    
-    Ok(indexed_results.into_iter().map(|(_, r)| r).take(limit).collect())
+
+    Ok(indexed_results
+        .into_iter()
+        .map(|(_, r)| r)
+        .take(limit)
+        .collect())
 }
 
 pub async fn find_impacted(

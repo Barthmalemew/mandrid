@@ -102,7 +102,7 @@
 
         async function fetchMemories() {
             try {
-                const response = await fetch('/api/memories');
+                const response = await fetch('/api/memories?limit=500');
                 const data = await response.json();
                 allMemories = data;
                 renderMemories(data);
@@ -192,15 +192,26 @@
             return div.innerHTML;
         }
 
-        // Search logic
+        // Search logic (server-side)
+        let searchTimer = null;
         document.getElementById('search-input').addEventListener('input', (e) => {
-            const query = e.target.value.toLowerCase();
-            const filtered = allMemories.filter(m => 
-                m.text.toLowerCase().includes(query) || 
-                (m.tag && m.tag.toLowerCase().includes(query)) ||
-                (m.name && m.name.toLowerCase().includes(query))
-            );
-            renderMemories(filtered);
+            const q = e.target.value.trim();
+            if (searchTimer) clearTimeout(searchTimer);
+            searchTimer = setTimeout(async () => {
+                if (!q) {
+                    renderMemories(allMemories);
+                    updateStats(allMemories);
+                    return;
+                }
+                try {
+                    const resp = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=50`);
+                    const data = await resp.json();
+                    renderMemories(data);
+                    updateStats(data);
+                } catch (err) {
+                    console.error('Search failed:', err);
+                }
+            }, 200);
         });
 
         document.getElementById('refresh-btn').addEventListener('click', fetchMemories);

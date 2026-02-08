@@ -10,12 +10,12 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use fastembed::{TextEmbedding};
+use fastembed::{TextEmbedding, TextRerank};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::index::Index;
-use lancedb::index::scalar::{FtsIndexBuilder, FullTextSearchQuery};
-use lancedb::rerankers::rrf::RRFReranker;
+use lancedb::index::scalar::FtsIndexBuilder;
+use serde::Deserialize;
 
 use arrow_array::RecordBatch;
 use ignore::WalkBuilder;
@@ -28,12 +28,15 @@ use lsp_types::{
 };
 
 use axum::{
+    extract::Query,
     extract::State,
     response::Html,
     routing::get,
     Json, Router,
 };
 use tower_http::cors::CorsLayer;
+
+use tokio::sync::Mutex;
 
 use crate::chunker::*;
 use crate::db::*;
@@ -85,6 +88,23 @@ enum Command {
         /// Optional context tag (e.g. "auth-refactor")
         #[arg(long, default_value = "interaction")]
         tag: String,
+
+        /// Memory type to store (e.g. interaction, trace)
+        #[arg(long, default_value = "interaction")]
+        memory_type: String,
+
+        /// Optional status (e.g. success, failure)
+        #[arg(long, default_value = "n/a")]
+        status: String,
+
+        /// Optional file path field (defaults based on memory type)
+        #[arg(long)]
+        file_path: Option<String>,
+
+        /// Optional name field (e.g. command name)
+        #[arg(long)]
+        name: Option<String>,
+
         #[arg(long)]
         session: Option<String>,
     },
@@ -201,6 +221,9 @@ enum Command {
         /// Filter by name or file
         #[arg(short, long)]
         query: Option<String>,
+
+        #[arg(long)]
+        json: bool,
     },
 
     /// Automatically sync git history into reasoning traces.
@@ -214,6 +237,9 @@ enum Command {
         symbol: String,
         #[arg(long, default_value_t = 2)]
         depth: usize,
+
+        #[arg(long)]
+        json: bool,
     },
 
     /// Launch the Mandrid Web Dashboard.
@@ -259,6 +285,27 @@ struct AskJsonResult {
 struct AskJsonPayload {
     question: String,
     results: Vec<AskJsonResult>,
+}
+
+#[derive(Clone)]
+struct ServeState {
+    db_path: PathBuf,
+    cache_dir: Option<PathBuf>,
+    embedder: Arc<Mutex<TextEmbedding>>,
+    reranker: Arc<Mutex<Option<TextRerank>>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoriesQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    q: String,
+    limit: Option<usize>,
+    rerank: Option<bool>,
+    vector_only: Option<bool>,
 }
 
 fn get_ignore_matcher(root: &Path) -> ignore::gitignore::Gitignore {
@@ -310,30 +357,33 @@ async fn main() -> Result<()> {
             add_rows(&table, vec![row]).await?;
             println!("Saved");
         }
-        Command::Log { text, tag, session } => {
+        Command::Log { text, tag, memory_type, status, file_path, name, session } => {
             let mut embedder = init_embedder(cache_dir.clone(), true)?;
             let table = open_or_create_table(&db_path).await?;
 
-            let embedding = embed_prefixed(&mut embedder, "passage", &text)?;
+            let prefix = if memory_type == "trace" { "trace" } else { "passage" };
+            let embedding = embed_prefixed(&mut embedder, prefix, &text)?;
             let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+
+            let default_path = if memory_type == "trace" { "terminal" } else { "interaction" };
             let row = MemoryRow {
                 vector: embedding,
                 text,
                 tag,
-                memory_type: "interaction".to_string(),
-                file_path: "interaction".to_string(),
+                memory_type: memory_type.clone(),
+                file_path: file_path.unwrap_or_else(|| default_path.to_string()),
                 line_start: 0,
                 session_id: session.unwrap_or_else(|| "default".to_string()),
-                name: String::new(),
+                name: name.unwrap_or_default(),
                 references: "[]".to_string(),
                 depends_on: "[]".to_string(),
-                status: "n/a".to_string(),
+                status,
                 mtime_secs: 0,
                 size_bytes: 0,
                 created_at: now,
             };
             add_rows(&table, vec![row]).await?;
-            println!("Logged interaction");
+            println!("Logged");
         }
         Command::Think { text, session } => {
             let mut embedder = init_embedder(cache_dir.clone(), true)?;
@@ -645,6 +695,40 @@ Run `mem context` to start.
                 db_file_map.insert(PathBuf::from(row.file_path), (row.mtime_secs, row.size_bytes));
             }
 
+            let mut seen_on_disk = std::collections::HashSet::new();
+            let matcher = get_ignore_matcher(&project_root);
+            let mut files_to_process = Vec::new();
+            for result in WalkBuilder::new(&root_dir).hidden(false).git_ignore(true).build() {
+                if let Ok(entry) = result {
+                    let path = entry.path();
+                    if path.is_file() && is_supported_file(path) && !is_ignored(&matcher, path) {
+                        let rel_path = path.strip_prefix(&project_root).unwrap_or(path).to_path_buf();
+                        seen_on_disk.insert(rel_path.clone());
+                        
+                        let metadata = fs::metadata(path)?;
+                        let mtime = metadata.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+                        let size = metadata.len();
+                        
+                        if let Some((db_mtime, db_size)) = db_file_map.get(&rel_path) {
+                            if *db_mtime == mtime && *db_size == size {
+                                continue;
+                            }
+                        }
+                        files_to_process.push((path.to_path_buf(), rel_path));
+                    }
+                }
+            }
+
+            // Prune files no longer on disk
+            for db_rel_path in db_file_map.keys() {
+                if !seen_on_disk.contains(db_rel_path) {
+                    let tag = format!("code:{}", db_rel_path.display());
+                    table.delete(format!("tag = '{}'", tag.replace('\'', "''")).as_str()).await?;
+                    println!("Pruned {}", db_rel_path.display());
+                }
+            }
+
+
             let matcher = get_ignore_matcher(&project_root);
             let mut files_to_process = Vec::new();
             for result in WalkBuilder::new(&root_dir).hidden(false).git_ignore(true).build() {
@@ -717,7 +801,7 @@ Run `mem context` to start.
             let results = if rerank {
                 ask_hybrid(&table, &query_embedding, &final_query, limit, cache_dir.clone()).await?
             } else {
-                ask_table_logic(&table, &query_embedding, &final_query, limit, vector_only).await?
+                ask_rrf(&table, &query_embedding, &final_query, limit, vector_only).await?
             };
 
             if json_output {
@@ -844,7 +928,7 @@ Run `mem context` to start.
                 for s in symbols { println!("  - {}", s); }
             }
         }
-        Command::Symbols { query } => {
+        Command::Symbols { query, json } => {
             let table = open_table(&db_path).await?;
             let mut filter = "memory_type = 'code'".to_string();
             if let Some(ref q) = query {
@@ -855,23 +939,45 @@ Run `mem context` to start.
             let batches: Vec<RecordBatch> = stream.try_collect().await?;
             let rows = decode_rows(&batches, None)?;
 
-            println!("=== DETERMINISTIC SYMBOL MAP ===");
-            for row in rows {
-                if let Some(first_line) = row.text.lines().next() {
-                    if first_line.starts_with("[Context:") {
-                        let symbol = first_line.replace("[Context: ", "").replace(']', "");
-                        println!("{} -> {}:{}", symbol, row.file_path, row.line_start);
+            if json {
+                let mut symbols = Vec::new();
+                for row in rows {
+                    if let Some(first_line) = row.text.lines().next() {
+                        if first_line.starts_with("[Context:") {
+                            let symbol = first_line.replace("[Context: ", "").replace(']', "");
+                            symbols.push(serde_json::json!({
+                                "symbol": symbol,
+                                "file_path": row.file_path,
+                                "line_start": row.line_start,
+                                "name": row.name,
+                            }));
+                        }
+                    }
+                }
+                println!("{}", serde_json::to_string_pretty(&symbols)?);
+            } else {
+                println!("=== DETERMINISTIC SYMBOL MAP ===");
+                for row in rows {
+                    if let Some(first_line) = row.text.lines().next() {
+                        if first_line.starts_with("[Context:") {
+                            let symbol = first_line.replace("[Context: ", "").replace(']', "");
+                            println!("{} -> {}:{}", symbol, row.file_path, row.line_start);
+                        }
                     }
                 }
             }
         }
-        Command::Impact { symbol, depth } => {
+        Command::Impact { symbol, depth, json } => {
             let table = open_table(&db_path).await?;
-            println!("🔍 Calculating Blast Radius for: {}", symbol);
+            if !json {
+                println!("🔍 Calculating Blast Radius for: {}", symbol);
+            }
             
             let mut seen = std::collections::HashSet::new();
             let mut to_process = vec![(symbol.clone(), 0)];
             seen.insert(symbol.clone());
+
+            let mut impact_map = Vec::new();
 
             while let Some((current_symbol, current_depth)) = to_process.pop() {
                 if current_depth >= depth { continue; }
@@ -881,14 +987,29 @@ Run `mem context` to start.
 
                 for row in impacted {
                     let name = if row.name.is_empty() { "anonymous".to_string() } else { row.name.clone() };
-                    let indent = "  ".repeat(current_depth + 1);
-                    println!("{}↳ {} ({}:{})", indent, name, row.file_path, row.line_start);
+                    
+                    if json {
+                        impact_map.push(serde_json::json!({
+                            "source_symbol": current_symbol,
+                            "impacted_symbol": name,
+                            "file_path": row.file_path,
+                            "line_start": row.line_start,
+                            "depth": current_depth + 1
+                        }));
+                    } else {
+                        let indent = "  ".repeat(current_depth + 1);
+                        println!("{}↳ {} ({}:{})", indent, name, row.file_path, row.line_start);
+                    }
                     
                     if !seen.contains(&name) {
                         seen.insert(name.clone());
                         to_process.push((name, current_depth + 1));
                     }
                 }
+            }
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&impact_map)?);
             }
         }
         Command::SyncGit { commits } => {
@@ -926,22 +1047,88 @@ Run `mem context` to start.
             println!("Synced {} commits.", commits);
         }
         Command::Serve { port } => {
-            let db_p = db_path.clone();
-            
+            let embedder = init_embedder(cache_dir.clone(), true)?;
+            let state = ServeState {
+                db_path: db_path.clone(),
+                cache_dir: cache_dir.clone(),
+                embedder: Arc::new(Mutex::new(embedder)),
+                reranker: Arc::new(Mutex::new(None)),
+            };
+
             let app = Router::new()
                 .route("/", get(|| async { Html(include_str!("dashboard.html")) }))
-                .route("/api/memories", get(move |State(db_p): State<PathBuf>| async move {
-                    let table = match open_table(&db_p).await {
-                        Ok(t) => t,
-                        Err(_) => return Json(vec![]),
-                    };
-                    let stream = table.query().limit(100).execute().await.unwrap();
-                    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
-                    let rows = decode_rows(&batches, None).unwrap_or_default();
-                    Json(rows)
-                }))
+                .route(
+                    "/api/memories",
+                    get(|State(state): State<ServeState>, Query(q): Query<MemoriesQuery>| async move {
+                        let table = match open_table(&state.db_path).await {
+                            Ok(t) => t,
+                            Err(_) => return Json(Vec::<DecodedRow>::new()),
+                        };
+
+                        let limit = q.limit.unwrap_or(500).min(5000);
+                        let stream = match table.query().limit(limit).execute().await {
+                            Ok(s) => s,
+                            Err(_) => return Json(Vec::<DecodedRow>::new()),
+                        };
+                        let batches: Vec<RecordBatch> = match stream.try_collect().await {
+                            Ok(b) => b,
+                            Err(_) => return Json(Vec::<DecodedRow>::new()),
+                        };
+                        let mut rows = decode_rows(&batches, None).unwrap_or_default();
+                        rows.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+                        Json(rows)
+                    }),
+                )
+                .route(
+                    "/api/search",
+                    get(|State(state): State<ServeState>, Query(q): Query<SearchQuery>| async move {
+                        let table = match open_table(&state.db_path).await {
+                            Ok(t) => t,
+                            Err(_) => return Json(Vec::<DecodedRow>::new()),
+                        };
+
+                        let limit = q.limit.unwrap_or(25).min(200);
+                        let rerank = q.rerank.unwrap_or(false);
+                        let vector_only = q.vector_only.unwrap_or(false);
+
+                        let query_text = q.q;
+                        if query_text.trim().is_empty() {
+                            return Json(Vec::<DecodedRow>::new());
+                        }
+
+                        let query_vec = {
+                            let mut embedder = state.embedder.lock().await;
+                            match embed_prefixed(&mut embedder, "query", &query_text) {
+                                Ok(v) => v,
+                                Err(_) => return Json(Vec::<DecodedRow>::new()),
+                            }
+                        };
+
+                        let rows = if rerank {
+                            let mut reranker_guard = state.reranker.lock().await;
+                            if reranker_guard.is_none() {
+                                match init_reranker(state.cache_dir.clone(), false) {
+                                    Ok(r) => *reranker_guard = Some(r),
+                                    Err(_) => return Json(Vec::<DecodedRow>::new()),
+                                }
+                            }
+                            match reranker_guard.as_mut() {
+                                Some(r) => ask_hybrid_with_reranker(&table, &query_vec, &query_text, limit, r)
+                                    .await
+                                    .unwrap_or_default(),
+                                None => Vec::new(),
+                            }
+                        } else {
+                            ask_rrf(&table, &query_vec, &query_text, limit, vector_only)
+                                .await
+                                .unwrap_or_default()
+                        };
+
+                        Json(rows)
+                    }),
+                )
                 .layer(CorsLayer::permissive())
-                .with_state(db_p);
+                .with_state(state);
 
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
             println!("🚀 Mandrid Dashboard at http://localhost:{}", port);
@@ -958,16 +1145,18 @@ mandrid_preexec() {{
     export MANDRID_CMD_START=$(date +%s)
 }}
 
-mandrid_precmd() {{
-    local exit_code=$?
-    if [ -n "$MANDRID_LAST_CMD" ]; then
-        local now=$(date +%s)
-        local duration=$((now - MANDRID_CMD_START))
-        # Log to Mandrid in background to avoid terminal lag
-        (mem log --tag terminal "Command: $MANDRID_LAST_CMD | Status: $exit_code | Duration: ${{duration}}s" --session shell_history >/dev/null 2>&1 &)
-        unset MANDRID_LAST_CMD
-    fi
-}}
+ mandrid_precmd() {{
+     local exit_code=$?
+     if [ -n "$MANDRID_LAST_CMD" ] && [[ "$MANDRID_LAST_CMD" != "mem log"* ]] && [[ "$MANDRID_LAST_CMD" != "mem hook"* ]]; then
+         local now=$(date +%s)
+         local duration=$((now - MANDRID_CMD_START))
+         local status="success"
+         if [ $exit_code -ne 0 ]; then status="failure"; fi
+         # Log to Mandrid in background to avoid terminal lag
+         (mem log --memory-type trace --status "$status" --tag terminal --session shell_history "Command: $MANDRID_LAST_CMD | Exit: $exit_code | Duration: ${{duration}}s" >/dev/null 2>&1 &)
+         unset MANDRID_LAST_CMD
+     fi
+ }}
 
 autoload -Uz add-zsh-hook
 add-zsh-hook preexec mandrid_preexec
@@ -978,38 +1167,51 @@ add-zsh-hook precmd mandrid_precmd
 # Mandrid Bash Hook
 # Source this in your .bashrc: source <(mem hook bash)
 
-mandrid_log_cmd() {{
-    local exit_code=$?
-    local last_cmd=$(history 1 | sed 's/^[ ]*[0-9]*  //')
-    # Filter out empty commands or the log command itself
-    if [[ -n "$last_cmd" && "$last_cmd" != "mem log"* ]]; then
-        (mem log --tag terminal "Command: $last_cmd | Status: $exit_code" --session shell_history >/dev/null 2>&1 &)
-    fi
-}}
+ mandrid_log_cmd() {{
+     local exit_code=$?
+     local last_cmd=$(history 1 | sed 's/^[ ]*[0-9]*  //')
+     # Filter out empty commands or the log command itself
+     if [[ -n "$last_cmd" && "$last_cmd" != "mem log"* ]]; then
+         local status="success"
+         if [ $exit_code -ne 0 ]; then status="failure"; fi
+         (mem log --memory-type trace --status "$status" --tag terminal --session shell_history "Command: $last_cmd | Exit: $exit_code" >/dev/null 2>&1 &)
+     fi
+ }}
 
 PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
 "#);
             } else if shell == "powershell" || shell == "pwsh" {
                 println!(r#"
-# Mandrid PowerShell Hook
-# Add this to your $PROFILE: Invoke-Expression (& mem hook powershell)
+ # Mandrid PowerShell Hook
+ # Add this to your $PROFILE: Invoke-Expression (& mem hook powershell)
 
-$MANDRID_CMD_START = 0
+ $global:MANDRID_LAST_HISTORY_ID = 0
 
-function prompt {{
-    $exit_code = $?
-    $last_cmd = Get-History -Count 1
-    if ($last_cmd -and $MANDRID_LAST_CMD -eq $last_cmd.CommandLine) {{
-        $now = [DateTimeOffset]::Now.ToUnixTimeSeconds()
-        $duration = $now - $MANDRID_CMD_START
-        # Log to Mandrid in background
-        Start-Process -FilePath "mem" -ArgumentList "log", "--tag", "terminal", "--session", "shell_history", "Command: $($last_cmd.CommandLine) | Status: $($exit_code) | Duration: $($duration)s" -NoNewWindow
-        $global:MANDRID_LAST_CMD = $null
-    }}
-    "PS $($executionContext.SessionState.Path.CurrentLocation)> "
-}}
+ function prompt {{
+     $last = Get-History -Count 1
+     if ($last -and $last.Id -ne $global:MANDRID_LAST_HISTORY_ID) {{
+         $global:MANDRID_LAST_HISTORY_ID = $last.Id
 
-$global:MANDRID_LAST_CMD = $null
+         $exit_code = 0
+         if (-not $?) {{
+             if ($LASTEXITCODE -ne $null -and $LASTEXITCODE -ne 0) {{ $exit_code = $LASTEXITCODE }} else {{ $exit_code = 1 }}
+         }}
+
+         $status = if ($exit_code -eq 0) {{ "success" }} else {{ "failure" }}
+         $text = "Command: $($last.CommandLine) | Exit: $exit_code"
+
+         # Log to Mandrid in background
+         Start-Process -FilePath "mem" -ArgumentList @(
+             "log",
+             "--memory-type", "trace",
+             "--status", $status,
+             "--tag", "terminal",
+             "--session", "shell_history",
+             $text
+         ) -NoNewWindow
+     }}
+     "PS $($executionContext.SessionState.Path.CurrentLocation)> "
+ }}
 "#);
             } else {
                 anyhow::bail!("Unsupported shell: {}", shell);
@@ -1025,14 +1227,24 @@ $global:MANDRID_LAST_CMD = $null
             for res in rx {
                 if let Ok(event) = res {
                     for path in event.paths {
-                        if is_supported_file(&path) && !is_ignored(&matcher, &path) {
+                        if !is_supported_file(&path) || is_ignored(&matcher, &path) { continue; }
+                        
+                        let rel_path_result = path.strip_prefix(&project_root).map(|p| p.to_path_buf());
+                        let rel_path = match rel_path_result {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        let tag = format!("code:{}", rel_path.display());
+
+                        if event.kind.is_remove() || !path.exists() {
+                            let _ = table.delete(format!("tag = '{}'", tag.replace('\'', "''")).as_str()).await;
+                            eprintln!("Removed {}", rel_path.display());
+                        } else if event.kind.is_modify() || event.kind.is_create() || event.kind.is_access() {
                             let abs_path = fs::canonicalize(&path).unwrap_or(path.clone());
-                            let rel_path = abs_path.strip_prefix(&project_root).unwrap_or(&abs_path);
-                            if let Ok(rows) = digest_file_logic(&mut embedder, &abs_path, rel_path).await {
-                                let tag = format!("code:{}", rel_path.display());
+                            if let Ok(rows) = digest_file_logic(&mut embedder, &abs_path, &rel_path).await {
                                 let _ = table.delete(format!("tag = '{}'", tag.replace('\'', "''")).as_str()).await;
                                 let _ = add_rows(&table, rows).await;
-                                eprintln!("Updated {}", path.display());
+                                eprintln!("Updated {}", rel_path.display());
                             }
                         }
                     }
@@ -1171,11 +1383,4 @@ async fn digest_file_content_logic(embedder: &mut TextEmbedding, content: &str, 
     }).collect())
 }
 
-async fn ask_table_logic(table: &lancedb::Table, query_vector: &[f32], query_text: &str, limit: usize, vector_only: bool) -> Result<Vec<DecodedRow>> {
-    let query_builder = table.query().nearest_to(query_vector)?;
-    let stream = if vector_only { query_builder.limit(limit).execute().await? } else {
-        query_builder.full_text_search(FullTextSearchQuery::new(query_text.to_owned())).rerank(Arc::new(RRFReranker::default())).limit(limit).execute().await?
-    };
-    let batches: Vec<RecordBatch> = stream.try_collect().await?;
-    decode_rows(&batches, Some(limit))
-}
+// (ask logic lives in src/db.rs)

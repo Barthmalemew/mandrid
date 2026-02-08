@@ -49,6 +49,7 @@ use crate::task::*;
 
 const DEFAULT_DB_DIR: &str = ".mem_db";
 const AUTO_DIR_NAME: &str = ".mem_auto";
+const TRACE_OUTPUT_MAX_CHARS: usize = 8000;
 
 #[derive(ValueEnum, Clone, Debug)]
 enum ContextScope {
@@ -845,6 +846,18 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     out
 }
 
+fn truncate_for_trace(text: &str, max_chars: usize) -> (String, bool) {
+    if max_chars == 0 {
+        return (String::new(), !text.is_empty());
+    }
+    let count = text.chars().count();
+    if count > max_chars {
+        (truncate_chars(text, max_chars), true)
+    } else {
+        (text.to_string(), false)
+    }
+}
+
 fn auto_dir(project_root: &Path) -> PathBuf {
     project_root.join(AUTO_DIR_NAME)
 }
@@ -1520,12 +1533,30 @@ fn auto_hook_script() -> String {
     "#!/bin/sh\n# mandrid-auto-hook\nif command -v mem >/dev/null 2>&1; then\n  mem auto run --event git_commit >/dev/null 2>&1\nfi\n".to_string()
 }
 
-fn install_auto_git_hook(project_root: &Path) -> Result<()> {
-    let git_dir = project_root.join(".git");
-    if !git_dir.exists() {
-        anyhow::bail!("No .git directory found. Auto hook requires a git repository.");
+fn resolve_git_hooks_dir(project_root: &Path) -> Result<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "hooks"])
+        .current_dir(project_root)
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!("Failed to resolve git hooks directory.");
     }
-    let hook_path = git_dir.join("hooks/post-commit");
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        anyhow::bail!("Failed to resolve git hooks directory.");
+    }
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(project_root.join(path))
+    }
+}
+
+fn install_auto_git_hook(project_root: &Path) -> Result<()> {
+    let hooks_dir = resolve_git_hooks_dir(project_root)?;
+    fs::create_dir_all(&hooks_dir)?;
+    let hook_path = hooks_dir.join("post-commit");
     if hook_path.exists() {
         let existing = fs::read_to_string(&hook_path).unwrap_or_default();
         if existing.contains("mandrid-auto-hook") {
@@ -1550,7 +1581,8 @@ fn install_auto_git_hook(project_root: &Path) -> Result<()> {
 }
 
 fn uninstall_auto_git_hook(project_root: &Path) -> Result<()> {
-    let hook_path = project_root.join(".git/hooks/post-commit");
+    let hooks_dir = resolve_git_hooks_dir(project_root)?;
+    let hook_path = hooks_dir.join("post-commit");
     if !hook_path.exists() {
         println!("No post-commit hook found.");
         return Ok(());
@@ -3683,7 +3715,7 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
                         if event.kind.is_remove() || !path.exists() {
                             let _ = table.delete(format!("tag = '{}'", tag.replace('\'', "''")).as_str()).await;
                             eprintln!("Removed {}", rel_path.display());
-                        } else if event.kind.is_modify() || event.kind.is_create() || event.kind.is_access() {
+                        } else if event.kind.is_modify() || event.kind.is_create() {
                             let abs_path = fs::canonicalize(&path).unwrap_or(path.clone());
                             if let Ok(rows) = digest_file_logic(&mut embedder, &abs_path, &rel_path).await {
                                 let _ = table.delete(format!("tag = '{}'", tag.replace('\'', "''")).as_str()).await;
@@ -3983,26 +4015,32 @@ You are equipped with Mandrid, a local persistent memory layer. Use these tools 
             let end_time = SystemTime::now();
             let duration = end_time.duration_since(start_time).unwrap_or_default();
 
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let status = output.status.code().unwrap_or(-1);
 
             // Print output to user
             if !stdout.is_empty() { print!("{}", stdout); }
             if !stderr.is_empty() { eprintln!("{}", stderr); }
 
+            let (stdout_trimmed, stdout_truncated) = truncate_for_trace(&stdout, TRACE_OUTPUT_MAX_CHARS);
+            let (stderr_trimmed, stderr_truncated) = truncate_for_trace(&stderr, TRACE_OUTPUT_MAX_CHARS);
+
             let mut embedder = init_embedder(cache_dir.clone(), false)?;
             let table = open_or_create_table(&db_path).await?;
 
-            let reasoning = format!(
+            let mut reasoning = format!(
                 "Command: {}\nStatus: {}\nDuration: {:?}\nNote: {}\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
                 full_command,
                 status,
                 duration,
                 note.unwrap_or_else(|| "Automated trace".to_string()),
-                stdout,
-                stderr
+                stdout_trimmed,
+                stderr_trimmed
             );
+            if stdout_truncated || stderr_truncated {
+                reasoning.push_str("\n\n[output truncated for memory]");
+            }
 
             let embedding = embed_prefixed(&mut embedder, "trace", &reasoning)?;
             let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();

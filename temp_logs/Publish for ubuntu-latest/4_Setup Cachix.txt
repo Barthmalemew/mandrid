@@ -1,0 +1,28 @@
+﻿2026-02-08T13:32:41.1563853Z ##[group]Run cachix/cachix-action@v15
+2026-02-08T13:32:41.1564151Z with:
+2026-02-08T13:32:41.1564331Z   name: mandrid
+2026-02-08T13:32:41.1565354Z   authToken: ***
+2026-02-08T13:32:41.1565562Z   skipPush: false
+2026-02-08T13:32:41.1565769Z   skipAddingSubstituter: false
+2026-02-08T13:32:41.1565990Z   useDaemon: true
+2026-02-08T13:32:41.1566166Z env:
+2026-02-08T13:32:41.1566323Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:41.1566532Z   TMPDIR: /home/runner/work/_temp
+2026-02-08T13:32:41.1566775Z ##[endgroup]
+2026-02-08T13:32:41.2015028Z ##[group]Cachix: installing
+2026-02-08T13:32:41.2054983Z [command]/usr/bin/bash -c nix-env --quiet -j8 -iA cachix -f https://cachix.org/api/v1/install
+2026-02-08T13:32:43.9347456Z ##[endgroup]
+2026-02-08T13:32:43.9348594Z ##[group]Cachix: checking version
+2026-02-08T13:32:43.9352699Z [command]/home/runner/.nix-profile/bin/cachix --version
+2026-02-08T13:32:43.9747821Z cachix 1.10.1
+2026-02-08T13:32:43.9794733Z ##[endgroup]
+2026-02-08T13:32:43.9798284Z [command]/home/runner/.nix-profile/bin/cachix authtoken ***
+2026-02-08T13:32:44.0176289Z Written to /home/runner/.config/cachix/cachix.dhall
+2026-02-08T13:32:44.0220655Z ##[group]Cachix: using cache mandrid
+2026-02-08T13:32:44.0223506Z [command]/home/runner/.nix-profile/bin/cachix use mandrid
+2026-02-08T13:32:44.2116859Z No config at /home/runner/.config/nix/nix.conf:
+2026-02-08T13:32:44.2117345Z 
+2026-02-08T13:32:44.2117751Z /home/runner/.config/nix/nix.conf: openFile: does not exist (No such file or directory)
+2026-02-08T13:32:44.2118395Z 
+2026-02-08T13:32:44.2118880Z Configured https://mandrid.cachix.org binary cache in /home/runner/.config/nix/nix.conf
+2026-02-08T13:32:44.2205350Z ##[endgroup]

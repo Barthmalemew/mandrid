@@ -1,0 +1,59 @@
+﻿2026-02-08T13:32:46.8158182Z ##[group]Run Swatinem/rust-cache@v2
+2026-02-08T13:32:46.8158670Z with:
+2026-02-08T13:32:46.8158893Z   cache-on-failure: true
+2026-02-08T13:32:46.8159173Z   prefix-key: v0-rust
+2026-02-08T13:32:46.8159443Z   add-job-id-key: true
+2026-02-08T13:32:46.8159729Z   add-rust-environment-hash-key: true
+2026-02-08T13:32:46.8160029Z   cache-targets: true
+2026-02-08T13:32:46.8160279Z   cache-all-crates: false
+2026-02-08T13:32:46.8160562Z   cache-workspace-crates: false
+2026-02-08T13:32:46.8160834Z   save-if: true
+2026-02-08T13:32:46.8161089Z   cache-provider: github
+2026-02-08T13:32:46.8161351Z   cache-bin: true
+2026-02-08T13:32:46.8161562Z   lookup-only: false
+2026-02-08T13:32:46.8161734Z env:
+2026-02-08T13:32:46.8161872Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:46.8162059Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-02-08T13:32:46.8162282Z   CARGO_INCREMENTAL: 0
+2026-02-08T13:32:46.8162457Z   CARGO_TERM_COLOR: always
+2026-02-08T13:32:46.8162633Z ##[endgroup]
+2026-02-08T13:32:49.5138334Z ##[group]Cache Configuration
+2026-02-08T13:32:49.5138867Z Cache Provider:
+2026-02-08T13:32:49.5139114Z     github
+2026-02-08T13:32:49.5139354Z Workspaces:
+2026-02-08T13:32:49.5139596Z     D:\a\mandrid\mandrid
+2026-02-08T13:32:49.5139897Z Cache Paths:
+2026-02-08T13:32:49.5140150Z     C:\Users\runneradmin\.cargo\bin
+2026-02-08T13:32:49.5140918Z     C:\Users\runneradmin\.cargo\.crates.toml
+2026-02-08T13:32:49.5141364Z     C:\Users\runneradmin\.cargo\.crates2.json
+2026-02-08T13:32:49.5141795Z     C:\Users\runneradmin\.cargo\registry
+2026-02-08T13:32:49.5142176Z     C:\Users\runneradmin\.cargo\git
+2026-02-08T13:32:49.5142532Z     D:\a\mandrid\mandrid\target
+2026-02-08T13:32:49.5142830Z Restore Key:
+2026-02-08T13:32:49.5143133Z     v0-rust-publish-Windows_NT-x64-02f6e914
+2026-02-08T13:32:49.5143492Z Cache Key:
+2026-02-08T13:32:49.5143803Z     v0-rust-publish-Windows_NT-x64-02f6e914-53696f13
+2026-02-08T13:32:49.5144214Z .. Prefix:
+2026-02-08T13:32:49.5144479Z   - v0-rust-publish-Windows_NT-x64
+2026-02-08T13:32:49.5144868Z .. Environment considered:
+2026-02-08T13:32:49.5145444Z   - Rust Version: 1.93.0 x86_64-pc-windows-msvc (254b59607d4417e9dffbc307138ae5c86280fe4c)
+2026-02-08T13:32:49.5146092Z   - CARGO_HOME
+2026-02-08T13:32:49.5146364Z   - CARGO_INCREMENTAL
+2026-02-08T13:32:49.5146647Z   - CARGO_TERM_COLOR
+2026-02-08T13:32:49.5146940Z .. Lockfiles considered:
+2026-02-08T13:32:49.5147260Z   - D:\a\mandrid\mandrid\Cargo.lock
+2026-02-08T13:32:49.5147647Z   - D:\a\mandrid\mandrid\Cargo.toml
+2026-02-08T13:32:49.5148252Z ##[endgroup]
+2026-02-08T13:32:49.5148403Z 
+2026-02-08T13:32:49.5148518Z ... Restoring cache ...
+2026-02-08T13:32:49.7514811Z Cache hit for: v0-rust-publish-Windows_NT-x64-02f6e914-53696f13
+2026-02-08T13:32:50.8020524Z Received 163577856 of 942188967 (17.4%), 154.2 MBs/sec
+2026-02-08T13:32:51.8036007Z Received 335544320 of 942188967 (35.6%), 158.9 MBs/sec
+2026-02-08T13:32:52.8047696Z Received 528482304 of 942188967 (56.1%), 167.2 MBs/sec
+2026-02-08T13:32:53.8058501Z Received 696254464 of 942188967 (73.9%), 165.3 MBs/sec
+2026-02-08T13:32:54.8636630Z Received 935329792 of 942188967 (99.3%), 175.8 MBs/sec
+2026-02-08T13:32:55.0662409Z Received 942188967 of 942188967 (100.0%), 170.3 MBs/sec
+2026-02-08T13:32:55.0665961Z Cache Size: ~899 MB (942188967 B)
+2026-02-08T13:32:55.0713232Z [command]"C:\Program Files\Git\usr\bin\tar.exe" -xf D:/a/_temp/3eb459bc-6ee7-4197-9ea1-db849599eb87/cache.tzst -P -C D:/a/mandrid/mandrid --force-local --use-compress-program "zstd -d"
+2026-02-08T13:33:14.3690407Z Cache restored successfully
+2026-02-08T13:33:14.4534512Z Restored from cache key "v0-rust-publish-Windows_NT-x64-02f6e914-53696f13" full match: true.

@@ -1,0 +1,61 @@
+﻿2026-02-08T13:32:46.9128411Z ##[group]Run Swatinem/rust-cache@v2
+2026-02-08T13:32:46.9128696Z with:
+2026-02-08T13:32:46.9128875Z   cache-on-failure: true
+2026-02-08T13:32:46.9129095Z   prefix-key: v0-rust
+2026-02-08T13:32:46.9129300Z   add-job-id-key: true
+2026-02-08T13:32:46.9129517Z   add-rust-environment-hash-key: true
+2026-02-08T13:32:46.9129767Z   cache-targets: true
+2026-02-08T13:32:46.9129959Z   cache-all-crates: false
+2026-02-08T13:32:46.9130192Z   cache-workspace-crates: false
+2026-02-08T13:32:46.9130419Z   save-if: true
+2026-02-08T13:32:46.9130598Z   cache-provider: github
+2026-02-08T13:32:46.9130796Z   cache-bin: true
+2026-02-08T13:32:46.9130975Z   lookup-only: false
+2026-02-08T13:32:46.9131147Z env:
+2026-02-08T13:32:46.9131304Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:46.9131788Z   TMPDIR: /home/runner/work/_temp
+2026-02-08T13:32:46.9132351Z   NIX_USER_CONF_FILES: /home/runner/work/_temp/cachix-daemon-JyVAJr/nix.conf:/home/runner/.config/nix/nix.conf:/etc/xdg/nix/nix.conf
+2026-02-08T13:32:46.9133002Z   CACHIX_DAEMON_DIR: /home/runner/work/_temp/cachix-daemon-JyVAJr
+2026-02-08T13:32:46.9133363Z   CARGO_HOME: /home/runner/.cargo
+2026-02-08T13:32:46.9133587Z   CARGO_INCREMENTAL: 0
+2026-02-08T13:32:46.9133778Z   CARGO_TERM_COLOR: always
+2026-02-08T13:32:46.9133980Z ##[endgroup]
+2026-02-08T13:32:48.4771846Z ##[group]Cache Configuration
+2026-02-08T13:32:48.4772758Z Cache Provider:
+2026-02-08T13:32:48.4773393Z     github
+2026-02-08T13:32:48.4773952Z Workspaces:
+2026-02-08T13:32:48.4774445Z     /home/runner/work/mandrid/mandrid
+2026-02-08T13:32:48.4775099Z Cache Paths:
+2026-02-08T13:32:48.4775782Z     /home/runner/.cargo/bin
+2026-02-08T13:32:48.4776527Z     /home/runner/.cargo/.crates.toml
+2026-02-08T13:32:48.4777228Z     /home/runner/.cargo/.crates2.json
+2026-02-08T13:32:48.4777849Z     /home/runner/.cargo/registry
+2026-02-08T13:32:48.4779519Z     /home/runner/.cargo/git
+2026-02-08T13:32:48.4779932Z     /home/runner/work/mandrid/mandrid/target
+2026-02-08T13:32:48.4780360Z Restore Key:
+2026-02-08T13:32:48.4780676Z     v0-rust-publish-Linux-x64-e1594588
+2026-02-08T13:32:48.4781107Z Cache Key:
+2026-02-08T13:32:48.4781613Z     v0-rust-publish-Linux-x64-e1594588-53696f13
+2026-02-08T13:32:48.4782080Z .. Prefix:
+2026-02-08T13:32:48.4782381Z   - v0-rust-publish-Linux-x64
+2026-02-08T13:32:48.4782771Z .. Environment considered:
+2026-02-08T13:32:48.4783404Z   - Rust Version: 1.93.0 x86_64-unknown-linux-gnu (254b59607d4417e9dffbc307138ae5c86280fe4c)
+2026-02-08T13:32:48.4784491Z   - CARGO_HOME
+2026-02-08T13:32:48.4784788Z   - CARGO_INCREMENTAL
+2026-02-08T13:32:48.4785119Z   - CARGO_TERM_COLOR
+2026-02-08T13:32:48.4793071Z .. Lockfiles considered:
+2026-02-08T13:32:48.4793530Z   - /home/runner/work/mandrid/mandrid/Cargo.lock
+2026-02-08T13:32:48.4794092Z   - /home/runner/work/mandrid/mandrid/Cargo.toml
+2026-02-08T13:32:48.4794837Z ##[endgroup]
+2026-02-08T13:32:48.4795010Z 
+2026-02-08T13:32:48.4795139Z ... Restoring cache ...
+2026-02-08T13:32:48.6229751Z Cache hit for: v0-rust-publish-Linux-x64-e1594588-53696f13
+2026-02-08T13:32:49.7547844Z Received 134217728 of 917617634 (14.6%), 124.9 MBs/sec
+2026-02-08T13:32:50.7560136Z Received 364904448 of 917617634 (39.8%), 171.9 MBs/sec
+2026-02-08T13:32:51.7555593Z Received 583008256 of 917617634 (63.5%), 183.7 MBs/sec
+2026-02-08T13:32:52.7614522Z Received 805306368 of 917617634 (87.8%), 190.7 MBs/sec
+2026-02-08T13:32:53.2820187Z Received 917617634 of 917617634 (100.0%), 192.2 MBs/sec
+2026-02-08T13:32:53.2822083Z Cache Size: ~875 MB (917617634 B)
+2026-02-08T13:32:53.2869526Z [command]/usr/bin/tar -xf /home/runner/work/_temp/ae69094e-349f-405d-8d1f-a46c465c5acf/cache.tzst -P -C /home/runner/work/mandrid/mandrid --use-compress-program unzstd
+2026-02-08T13:32:59.1375612Z Cache restored successfully
+2026-02-08T13:32:59.3075017Z Restored from cache key "v0-rust-publish-Linux-x64-e1594588-53696f13" full match: true.

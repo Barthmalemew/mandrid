@@ -84,8 +84,14 @@ jobs:
         env:
           CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
         run: |
-          # Use watch-exec to ensure everything built is pushed immediately
-          cachix watch-exec mandrid -- nix build .#mandrid
+          if [ -z "$CACHIX_AUTH_TOKEN" ]; then
+            echo "Error: CACHIX_AUTH_TOKEN is not set. Check your GitHub Secrets."
+            exit 1
+          fi
+          nix build .#mandrid
+          # Get the closure of the build result and push it all explicitly
+          echo "Pushing store paths to Cachix..."
+          nix path-info --recursive .#mandrid | cachix push mandrid
 
       - name: Build with Cargo (all platforms)
         run: cargo build --locked --release

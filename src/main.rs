@@ -619,8 +619,8 @@ async fn main() -> Result<()> {
 
             let mut filter = format!("(session_id = '{}' OR memory_type = 'manual' OR memory_type = 'task' OR memory_type = 'thought')", session_id.replace('\'', "''"));
             
-            if let Some(f) = file {
-                let abs_path = fs::canonicalize(&f).unwrap_or(f);
+            if let Some(ref f) = file {
+                let abs_path = fs::canonicalize(f).unwrap_or(f.clone());
                 let rel_path = abs_path.strip_prefix(&project_root).unwrap_or(&abs_path);
                 filter.push_str(&format!(" AND (file_path = '{}' OR memory_type = 'manual' OR memory_type = 'task' OR memory_type = 'thought')", rel_path.display().to_string().replace('\'', "''")));
             }
@@ -648,7 +648,35 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            // ------------------------------------------------
+
+            // --- FEATURE: Symbolic Definition Splicing ---
+            let mut external_definitions = Vec::new();
+            if let Some(ref f) = file {
+                if let Ok(content) = fs::read_to_string(f) {
+                    let chunks = structural_chunk(&content, f);
+                    let mut unique_refs = std::collections::HashSet::new();
+                    for c in chunks {
+                        for r in c.references { unique_refs.insert(r); }
+                    }
+
+                    // For each reference, look up its definition in the DB
+                    for r in unique_refs {
+                        // Avoid recursion or noise: don't look up common keywords
+                        if r.len() < 3 { continue; }
+                        let ref_filter = format!("memory_type = 'code' AND name = '{}'", r.replace('\'', "''"));
+                        let stream = table.query().only_if(ref_filter).limit(1).execute().await?;
+                        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                        let mut defs = decode_rows(&batches, None)?;
+                        if let Some(def) = defs.pop() {
+                            // Only add if it's from a DIFFERENT file than the one we are focusing on
+                            if def.file_path != file.as_ref().unwrap().display().to_string() {
+                                external_definitions.push(def);
+                            }
+                        }
+                    }
+                }
+            }
+            // ----------------------------------------------
 
             if json {
                 let payload = serde_json::json!({
@@ -657,6 +685,7 @@ async fn main() -> Result<()> {
                     "active_tasks": active_tasks,
                     "active_thoughts": active_thoughts,
                     "recent_failures": recent_failures,
+                    "external_definitions": external_definitions,
                     "memories": rows
                 });
                 println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -677,50 +706,22 @@ async fn main() -> Result<()> {
                     }
                 }
                 if !recent_failures.is_empty() {
-                    println!("\n[⚠️ RECENT FAILURES]");
+                    println!("\n## ⚠️ RECENT FAILURES");
                     for f in &recent_failures {
                         println!("- {}: {}", f.tag.as_ref().unwrap_or(&"unknown".to_string()), f.text.lines().next().unwrap_or(""));
                     }
                 }
-                println!("\n[Recent Memories]");
-                for row in rows {
-                    println!("- [{}] {}", row.tag.unwrap_or_default(), row.text.lines().next().unwrap_or(""));
-                }
-            } else {
-                println!("<mandrid_context_guide>");
-                println!("Mandrid is a memory layer for you. Use `mem ask` for search and `mem impact` for blast-radius.");
-                println!("Run `mem context` frequently to keep your context window lean but relevant.");
-                println!("</mandrid_context_guide>\n");
 
-                println!("<project_context>");
-                println!("## AI Agent Role: {}", role.to_uppercase());
-                if role == "assistant" {
-                    println!("## CONSTRAINT: You are NOT allowed to write or modify code files directly.");
-                }
-                
-                if !active_tasks.is_empty() {
-                    println!("\n## CURRENT GOAL");
-                    for task in &active_tasks {
-                        println!("- **{}**: {}", task.tag.as_ref().unwrap_or(&"unknown".to_string()).replace("task:", ""), task.text);
+                if !external_definitions.is_empty() {
+                    println!("\n## 🕸️ EXTERNAL SYMBOL DEFINITIONS (Referenced in this file)");
+                    for def in external_definitions {
+                        println!("### {} ({}:{})", def.name, def.file_path, def.line_start);
+                        println!("{}", def.text);
                     }
-                }
-
-                if !active_thoughts.is_empty() {
-                    println!("\n## 🧠 ACTIVE REASONING");
-                    for t in &active_thoughts {
-                        println!("{}", t.text);
-                    }
-                }
-
-                if !recent_failures.is_empty() {
-                    println!("\n## ⚠️ RECENT FAILURES (Negative Memory)");
-                    for task in &recent_failures {
-                        println!("- **{}**: {}", task.tag.as_ref().unwrap_or(&"unknown".to_string()), task.text.lines().next().unwrap_or(""));
-                    }
-                    println!("Avoid repeating the mistakes captured in these traces.");
                 }
 
                 println!("\n## Active Session: {}", session_id);
+
                 for row in rows {
                     if (row.memory_type == "task" || row.memory_type == "thought") && row.status == "active" { continue; }
                     

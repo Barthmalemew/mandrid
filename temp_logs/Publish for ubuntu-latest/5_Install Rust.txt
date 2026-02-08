@@ -1,0 +1,201 @@
+﻿2026-02-08T13:32:44.2777415Z ##[group]Run dtolnay/rust-toolchain@stable
+2026-02-08T13:32:44.2777736Z with:
+2026-02-08T13:32:44.2777918Z   toolchain: stable
+2026-02-08T13:32:44.2778095Z env:
+2026-02-08T13:32:44.2778255Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:44.2778456Z   TMPDIR: /home/runner/work/_temp
+2026-02-08T13:32:44.2779006Z   NIX_USER_CONF_FILES: /home/runner/work/_temp/cachix-daemon-JyVAJr/nix.conf:/home/runner/.config/nix/nix.conf:/etc/xdg/nix/nix.conf
+2026-02-08T13:32:44.2779642Z   CACHIX_DAEMON_DIR: /home/runner/work/_temp/cachix-daemon-JyVAJr
+2026-02-08T13:32:44.2779954Z ##[endgroup]
+2026-02-08T13:32:44.2824665Z ##[group]Run : parse toolchain version
+2026-02-08T13:32:44.2824997Z [36;1m: parse toolchain version[0m
+2026-02-08T13:32:44.2825249Z [36;1mif [[ -z $toolchain ]]; then[0m
+2026-02-08T13:32:44.2825773Z [36;1m  # GitHub does not enforce `required: true` inputs itself. https://github.com/actions/runner/issues/1070[0m
+2026-02-08T13:32:44.2826320Z [36;1m  echo "'toolchain' is a required input" >&2[0m
+2026-02-08T13:32:44.2826790Z [36;1m  exit 1[0m
+2026-02-08T13:32:44.2827112Z [36;1melif [[ $toolchain =~ ^stable' '[0-9]+' '(year|month|week|day)s?' 'ago$ ]]; then[0m
+2026-02-08T13:32:44.2827505Z [36;1m  if [[ Linux == macOS ]]; then[0m
+2026-02-08T13:32:44.2828015Z [36;1m    echo "toolchain=1.$((($(date -v-$(sed 's/stable \([0-9]*\) \(.\).*/\1\2/' <<< $toolchain) +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT[0m
+2026-02-08T13:32:44.2828513Z [36;1m  else[0m
+2026-02-08T13:32:44.2828896Z [36;1m    echo "toolchain=1.$((($(date --date "${toolchain#stable }" +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT[0m
+2026-02-08T13:32:44.2829349Z [36;1m  fi[0m
+2026-02-08T13:32:44.2829640Z [36;1melif [[ $toolchain =~ ^stable' 'minus' '[0-9]+' 'releases?$ ]]; then[0m
+2026-02-08T13:32:44.2830180Z [36;1m  echo "toolchain=1.$((($(date +%s)/60/60/24-16569)/7/6-${toolchain//[^0-9]/}))" >> $GITHUB_OUTPUT[0m
+2026-02-08T13:32:44.2830831Z [36;1melif [[ $toolchain =~ ^1\.[0-9]+$ ]]; then[0m
+2026-02-08T13:32:44.2831348Z [36;1m  echo "toolchain=1.$((i=${toolchain#1.}, c=($(date +%s)/60/60/24-16569)/7/6, i+9*i*(10*i<=c)+90*i*(100*i<=c)))" >> $GITHUB_OUTPUT[0m
+2026-02-08T13:32:44.2832076Z [36;1melse[0m
+2026-02-08T13:32:44.2832309Z [36;1m  echo "toolchain=$toolchain" >> $GITHUB_OUTPUT[0m
+2026-02-08T13:32:44.2832590Z [36;1mfi[0m
+2026-02-08T13:32:44.2865827Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-02-08T13:32:44.2866170Z env:
+2026-02-08T13:32:44.2866333Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:44.2866558Z   TMPDIR: /home/runner/work/_temp
+2026-02-08T13:32:44.2867110Z   NIX_USER_CONF_FILES: /home/runner/work/_temp/cachix-daemon-JyVAJr/nix.conf:/home/runner/.config/nix/nix.conf:/etc/xdg/nix/nix.conf
+2026-02-08T13:32:44.2867765Z   CACHIX_DAEMON_DIR: /home/runner/work/_temp/cachix-daemon-JyVAJr
+2026-02-08T13:32:44.2868101Z   toolchain: stable
+2026-02-08T13:32:44.2868277Z ##[endgroup]
+2026-02-08T13:32:44.2972475Z ##[group]Run : construct rustup command line
+2026-02-08T13:32:44.2972806Z [36;1m: construct rustup command line[0m
+2026-02-08T13:32:44.2973268Z [36;1mecho "targets=$(for t in ${targets//,/ }; do echo -n ' --target' $t; done)" >> $GITHUB_OUTPUT[0m
+2026-02-08T13:32:44.2973901Z [36;1mecho "components=$(for c in ${components//,/ }; do echo -n ' --component' $c; done)" >> $GITHUB_OUTPUT[0m
+2026-02-08T13:32:44.2974373Z [36;1mecho "downgrade=" >> $GITHUB_OUTPUT[0m
+2026-02-08T13:32:44.3007417Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-02-08T13:32:44.3007759Z env:
+2026-02-08T13:32:44.3007933Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:44.3008144Z   TMPDIR: /home/runner/work/_temp
+2026-02-08T13:32:44.3009041Z   NIX_USER_CONF_FILES: /home/runner/work/_temp/cachix-daemon-JyVAJr/nix.conf:/home/runner/.config/nix/nix.conf:/etc/xdg/nix/nix.conf
+2026-02-08T13:32:44.3009750Z   CACHIX_DAEMON_DIR: /home/runner/work/_temp/cachix-daemon-JyVAJr
+2026-02-08T13:32:44.3010094Z   targets: 
+2026-02-08T13:32:44.3010267Z   components: 
+2026-02-08T13:32:44.3010443Z ##[endgroup]
+2026-02-08T13:32:44.3099859Z ##[group]Run : set $CARGO_HOME
+2026-02-08T13:32:44.3100551Z [36;1m: set $CARGO_HOME[0m
+2026-02-08T13:32:44.3101145Z [36;1mecho CARGO_HOME=${CARGO_HOME:-"$HOME/.cargo"} >> $GITHUB_ENV[0m
+2026-02-08T13:32:44.3139660Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-02-08T13:32:44.3140013Z env:
+2026-02-08T13:32:44.3140200Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:44.3140428Z   TMPDIR: /home/runner/work/_temp
+2026-02-08T13:32:44.3140999Z   NIX_USER_CONF_FILES: /home/runner/work/_temp/cachix-daemon-JyVAJr/nix.conf:/home/runner/.config/nix/nix.conf:/etc/xdg/nix/nix.conf
+2026-02-08T13:32:44.3141984Z   CACHIX_DAEMON_DIR: /home/runner/work/_temp/cachix-daemon-JyVAJr
+2026-02-08T13:32:44.3142471Z ##[endgroup]
+2026-02-08T13:32:44.3216526Z ##[group]Run : install rustup if needed
+2026-02-08T13:32:44.3216987Z [36;1m: install rustup if needed[0m
+2026-02-08T13:32:44.3217270Z [36;1mif ! command -v rustup &>/dev/null; then[0m
+2026-02-08T13:32:44.3218011Z [36;1m  curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs | sh -s -- --default-toolchain none -y[0m
+2026-02-08T13:32:44.3218744Z [36;1m  echo "$CARGO_HOME/bin" >> $GITHUB_PATH[0m
+2026-02-08T13:32:44.3219002Z [36;1mfi[0m
+2026-02-08T13:32:44.3249206Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-02-08T13:32:44.3249532Z env:
+2026-02-08T13:32:44.3249702Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:44.3249916Z   TMPDIR: /home/runner/work/_temp
+2026-02-08T13:32:44.3250460Z   NIX_USER_CONF_FILES: /home/runner/work/_temp/cachix-daemon-JyVAJr/nix.conf:/home/runner/.config/nix/nix.conf:/etc/xdg/nix/nix.conf
+2026-02-08T13:32:44.3251128Z   CACHIX_DAEMON_DIR: /home/runner/work/_temp/cachix-daemon-JyVAJr
+2026-02-08T13:32:44.3251721Z   CARGO_HOME: /home/runner/.cargo
+2026-02-08T13:32:44.3252181Z ##[endgroup]
+2026-02-08T13:32:44.3346577Z ##[group]Run rustup toolchain install stable --profile minimal --no-self-update
+2026-02-08T13:32:44.3347171Z [36;1mrustup toolchain install stable --profile minimal --no-self-update[0m
+2026-02-08T13:32:44.3389808Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-02-08T13:32:44.3390297Z env:
+2026-02-08T13:32:44.3390626Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:44.3391020Z   TMPDIR: /home/runner/work/_temp
+2026-02-08T13:32:44.3392274Z   NIX_USER_CONF_FILES: /home/runner/work/_temp/cachix-daemon-JyVAJr/nix.conf:/home/runner/.config/nix/nix.conf:/etc/xdg/nix/nix.conf
+2026-02-08T13:32:44.3393471Z   CACHIX_DAEMON_DIR: /home/runner/work/_temp/cachix-daemon-JyVAJr
+2026-02-08T13:32:44.3394099Z   CARGO_HOME: /home/runner/.cargo
+2026-02-08T13:32:44.3394532Z   RUSTUP_PERMIT_COPY_RENAME: 1
+2026-02-08T13:32:44.3394927Z ##[endgroup]
+2026-02-08T13:32:46.5172438Z info: syncing channel updates for 'stable-x86_64-unknown-linux-gnu'
+2026-02-08T13:32:46.6146071Z 
+2026-02-08T13:32:46.6247424Z   stable-x86_64-unknown-linux-gnu unchanged - rustc 1.93.0 (254b59607 2026-01-19)
+2026-02-08T13:32:46.6247989Z 
+2026-02-08T13:32:46.6301919Z ##[group]Run rustup default stable
+2026-02-08T13:32:46.6302440Z [36;1mrustup default stable[0m
+2026-02-08T13:32:46.6346350Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-02-08T13:32:46.6346882Z env:
+2026-02-08T13:32:46.6347157Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:46.6347513Z   TMPDIR: /home/runner/work/_temp
+2026-02-08T13:32:46.6348449Z   NIX_USER_CONF_FILES: /home/runner/work/_temp/cachix-daemon-JyVAJr/nix.conf:/home/runner/.config/nix/nix.conf:/etc/xdg/nix/nix.conf
+2026-02-08T13:32:46.6349550Z   CACHIX_DAEMON_DIR: /home/runner/work/_temp/cachix-daemon-JyVAJr
+2026-02-08T13:32:46.6350125Z   CARGO_HOME: /home/runner/.cargo
+2026-02-08T13:32:46.6350500Z ##[endgroup]
+2026-02-08T13:32:46.6492205Z info: using existing install for 'stable-x86_64-unknown-linux-gnu'
+2026-02-08T13:32:46.7069482Z info: default toolchain set to 'stable-x86_64-unknown-linux-gnu'
+2026-02-08T13:32:46.7070116Z 
+2026-02-08T13:32:46.7158437Z   stable-x86_64-unknown-linux-gnu unchanged - rustc 1.93.0 (254b59607 2026-01-19)
+2026-02-08T13:32:46.7158880Z 
+2026-02-08T13:32:46.7199314Z ##[group]Run : create cachekey
+2026-02-08T13:32:46.7199590Z [36;1m: create cachekey[0m
+2026-02-08T13:32:46.7200087Z [36;1mDATE=$(rustc +stable --version --verbose | sed -ne 's/^commit-date: \(20[0-9][0-9]\)-\([01][0-9]\)-\([0-3][0-9]\)$/\1\2\3/p')[0m
+2026-02-08T13:32:46.7200736Z [36;1mHASH=$(rustc +stable --version --verbose | sed -ne 's/^commit-hash: //p')[0m
+2026-02-08T13:32:46.7201220Z [36;1mecho "cachekey=$(echo $DATE$HASH | head -c12)" >> $GITHUB_OUTPUT[0m
+2026-02-08T13:32:46.7234363Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-02-08T13:32:46.7234697Z env:
+2026-02-08T13:32:46.7234869Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:46.7235078Z   TMPDIR: /home/runner/work/_temp
+2026-02-08T13:32:46.7235642Z   NIX_USER_CONF_FILES: /home/runner/work/_temp/cachix-daemon-JyVAJr/nix.conf:/home/runner/.config/nix/nix.conf:/etc/xdg/nix/nix.conf
+2026-02-08T13:32:46.7236306Z   CACHIX_DAEMON_DIR: /home/runner/work/_temp/cachix-daemon-JyVAJr
+2026-02-08T13:32:46.7236643Z   CARGO_HOME: /home/runner/.cargo
+2026-02-08T13:32:46.7236881Z ##[endgroup]
+2026-02-08T13:32:46.7889666Z ##[group]Run : disable incremental compilation
+2026-02-08T13:32:46.7890035Z [36;1m: disable incremental compilation[0m
+2026-02-08T13:32:46.7890358Z [36;1mif [ -z "${CARGO_INCREMENTAL+set}" ]; then[0m
+2026-02-08T13:32:46.7890699Z [36;1m  echo CARGO_INCREMENTAL=0 >> $GITHUB_ENV[0m
+2026-02-08T13:32:46.7890982Z [36;1mfi[0m
+2026-02-08T13:32:46.7923272Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-02-08T13:32:46.7923615Z env:
+2026-02-08T13:32:46.7923804Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:46.7924033Z   TMPDIR: /home/runner/work/_temp
+2026-02-08T13:32:46.7924602Z   NIX_USER_CONF_FILES: /home/runner/work/_temp/cachix-daemon-JyVAJr/nix.conf:/home/runner/.config/nix/nix.conf:/etc/xdg/nix/nix.conf
+2026-02-08T13:32:46.7925444Z   CACHIX_DAEMON_DIR: /home/runner/work/_temp/cachix-daemon-JyVAJr
+2026-02-08T13:32:46.7925803Z   CARGO_HOME: /home/runner/.cargo
+2026-02-08T13:32:46.7926033Z ##[endgroup]
+2026-02-08T13:32:46.7994156Z ##[group]Run : enable colors in Cargo output
+2026-02-08T13:32:46.7994464Z [36;1m: enable colors in Cargo output[0m
+2026-02-08T13:32:46.7994749Z [36;1mif [ -z "${CARGO_TERM_COLOR+set}" ]; then[0m
+2026-02-08T13:32:46.7995070Z [36;1m  echo CARGO_TERM_COLOR=always >> $GITHUB_ENV[0m
+2026-02-08T13:32:46.7995341Z [36;1mfi[0m
+2026-02-08T13:32:46.8024067Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-02-08T13:32:46.8024385Z env:
+2026-02-08T13:32:46.8024554Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:46.8024766Z   TMPDIR: /home/runner/work/_temp
+2026-02-08T13:32:46.8025310Z   NIX_USER_CONF_FILES: /home/runner/work/_temp/cachix-daemon-JyVAJr/nix.conf:/home/runner/.config/nix/nix.conf:/etc/xdg/nix/nix.conf
+2026-02-08T13:32:46.8025969Z   CACHIX_DAEMON_DIR: /home/runner/work/_temp/cachix-daemon-JyVAJr
+2026-02-08T13:32:46.8026326Z   CARGO_HOME: /home/runner/.cargo
+2026-02-08T13:32:46.8026548Z   CARGO_INCREMENTAL: 0
+2026-02-08T13:32:46.8026743Z ##[endgroup]
+2026-02-08T13:32:46.8112664Z ##[group]Run : enable Cargo sparse registry
+2026-02-08T13:32:46.8112999Z [36;1m: enable Cargo sparse registry[0m
+2026-02-08T13:32:46.8113359Z [36;1m# implemented in 1.66, stabilized in 1.68, made default in 1.70[0m
+2026-02-08T13:32:46.8114083Z [36;1mif [ -z "${CARGO_REGISTRIES_CRATES_IO_PROTOCOL+set}" -o -f "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol ]; then[0m
+2026-02-08T13:32:46.8114852Z [36;1m  if rustc +stable --version --verbose | grep -q '^release: 1\.6[89]\.'; then[0m
+2026-02-08T13:32:46.8115441Z [36;1m    touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true[0m
+2026-02-08T13:32:46.8116009Z [36;1m    echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse >> $GITHUB_ENV[0m
+2026-02-08T13:32:46.8116519Z [36;1m  elif rustc +stable --version --verbose | grep -q '^release: 1\.6[67]\.'; then[0m
+2026-02-08T13:32:46.8117108Z [36;1m    touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true[0m
+2026-02-08T13:32:46.8117812Z [36;1m    echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git >> $GITHUB_ENV[0m
+2026-02-08T13:32:46.8118157Z [36;1m  fi[0m
+2026-02-08T13:32:46.8118335Z [36;1mfi[0m
+2026-02-08T13:32:46.8147457Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-02-08T13:32:46.8147802Z env:
+2026-02-08T13:32:46.8147990Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:46.8148219Z   TMPDIR: /home/runner/work/_temp
+2026-02-08T13:32:46.8148786Z   NIX_USER_CONF_FILES: /home/runner/work/_temp/cachix-daemon-JyVAJr/nix.conf:/home/runner/.config/nix/nix.conf:/etc/xdg/nix/nix.conf
+2026-02-08T13:32:46.8149439Z   CACHIX_DAEMON_DIR: /home/runner/work/_temp/cachix-daemon-JyVAJr
+2026-02-08T13:32:46.8149784Z   CARGO_HOME: /home/runner/.cargo
+2026-02-08T13:32:46.8150030Z   CARGO_INCREMENTAL: 0
+2026-02-08T13:32:46.8150256Z   CARGO_TERM_COLOR: always
+2026-02-08T13:32:46.8150471Z ##[endgroup]
+2026-02-08T13:32:46.8566297Z ##[group]Run : work around spurious network errors in curl 8.0
+2026-02-08T13:32:46.8566737Z [36;1m: work around spurious network errors in curl 8.0[0m
+2026-02-08T13:32:46.8567342Z [36;1m# https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/timeout.20investigation[0m
+2026-02-08T13:32:46.8567997Z [36;1mif rustc +stable --version --verbose | grep -q '^release: 1\.7[01]\.'; then[0m
+2026-02-08T13:32:46.8568480Z [36;1m  echo CARGO_HTTP_MULTIPLEXING=false >> $GITHUB_ENV[0m
+2026-02-08T13:32:46.8568795Z [36;1mfi[0m
+2026-02-08T13:32:46.8600799Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-02-08T13:32:46.8601115Z env:
+2026-02-08T13:32:46.8601284Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:46.8601825Z   TMPDIR: /home/runner/work/_temp
+2026-02-08T13:32:46.8602515Z   NIX_USER_CONF_FILES: /home/runner/work/_temp/cachix-daemon-JyVAJr/nix.conf:/home/runner/.config/nix/nix.conf:/etc/xdg/nix/nix.conf
+2026-02-08T13:32:46.8603385Z   CACHIX_DAEMON_DIR: /home/runner/work/_temp/cachix-daemon-JyVAJr
+2026-02-08T13:32:46.8603728Z   CARGO_HOME: /home/runner/.cargo
+2026-02-08T13:32:46.8603949Z   CARGO_INCREMENTAL: 0
+2026-02-08T13:32:46.8604155Z   CARGO_TERM_COLOR: always
+2026-02-08T13:32:46.8604353Z ##[endgroup]
+2026-02-08T13:32:46.8826149Z ##[group]Run rustc +stable --version --verbose
+2026-02-08T13:32:46.8826504Z [36;1mrustc +stable --version --verbose[0m
+2026-02-08T13:32:46.8858673Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-02-08T13:32:46.8858995Z env:
+2026-02-08T13:32:46.8859158Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:46.8859373Z   TMPDIR: /home/runner/work/_temp
+2026-02-08T13:32:46.8859947Z   NIX_USER_CONF_FILES: /home/runner/work/_temp/cachix-daemon-JyVAJr/nix.conf:/home/runner/.config/nix/nix.conf:/etc/xdg/nix/nix.conf
+2026-02-08T13:32:46.8860595Z   CACHIX_DAEMON_DIR: /home/runner/work/_temp/cachix-daemon-JyVAJr
+2026-02-08T13:32:46.8860933Z   CARGO_HOME: /home/runner/.cargo
+2026-02-08T13:32:46.8861180Z   CARGO_INCREMENTAL: 0
+2026-02-08T13:32:46.8861382Z   CARGO_TERM_COLOR: always
+2026-02-08T13:32:46.8861818Z ##[endgroup]
+2026-02-08T13:32:46.9038591Z rustc 1.93.0 (254b59607 2026-01-19)
+2026-02-08T13:32:46.9039294Z binary: rustc
+2026-02-08T13:32:46.9039836Z commit-hash: 254b59607d4417e9dffbc307138ae5c86280fe4c
+2026-02-08T13:32:46.9040519Z commit-date: 2026-01-19
+2026-02-08T13:32:46.9041008Z host: x86_64-unknown-linux-gnu
+2026-02-08T13:32:46.9041336Z release: 1.93.0
+2026-02-08T13:32:46.9041851Z LLVM version: 21.1.8

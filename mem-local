@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Mandrid Local Wrapper
+export ORT_DYLIB_PATH="/nix/store/7qjkk7p7pyn7y3dx36a6bk2msfdcvmk9-onnxruntime-1.23.2/lib/libonnxruntime.so"
+export LD_LIBRARY_PATH="$(dirname $ORT_DYLIB_PATH):$LD_LIBRARY_PATH"
+exec "/home/barthmalemew/Projects/mandrid/target/release/mem" "$@"

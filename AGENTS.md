@@ -1,0 +1,16 @@
+# Mandrid Memory Agent Instructions
+
+This project uses **Mandrid** (`mem`) to store context and reasoning.
+Before starting tasks, please verify the memory state.
+
+## Quick Start
+1. **Check Context:** Run `mem brief` to see recent decisions and reasoning.
+2. **Search:** Run `mem ask --json "query"` to find relevant code or patterns.
+3. **Capture:** When completing a significant task, run:
+   `mem capture "Reasoning: why I did this change"`
+
+## Tools
+- `mem learn`: Re-indexes the codebase (run this if you suspect the index is stale).
+- `mem capture`: Saves your git diff + reasoning to the permanent record.
+
+Do not edit `.mem_db/` manually.

@@ -1,0 +1,16 @@
+﻿2026-02-08T13:33:14.4853502Z ##[group]Run arduino/setup-protoc@v3
+2026-02-08T13:33:14.4853848Z with:
+2026-02-08T13:33:14.4854456Z   repo-token: ***
+2026-02-08T13:33:14.4854646Z   version: 23.x
+2026-02-08T13:33:14.4854825Z   include-pre-releases: false
+2026-02-08T13:33:14.4855037Z env:
+2026-02-08T13:33:14.4855192Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:33:14.4855406Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-02-08T13:33:14.4855642Z   CARGO_INCREMENTAL: 0
+2026-02-08T13:33:14.4855829Z   CARGO_TERM_COLOR: always
+2026-02-08T13:33:14.4856021Z   CACHE_ON_FAILURE: true
+2026-02-08T13:33:14.4856208Z ##[endgroup]
+2026-02-08T13:33:18.0037836Z Getting protoc version: v23.4
+2026-02-08T13:33:18.0055824Z Downloading archive: https://github.com/protocolbuffers/protobuf/releases/download/v23.4/protoc-23.4-win64.zip
+2026-02-08T13:33:18.3096917Z [command]"C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Unrestricted -Command "$ErrorActionPreference = 'Stop' ; try { Add-Type -AssemblyName System.IO.Compression.ZipFile } catch { } ; try { [System.IO.Compression.ZipFile]::ExtractToDirectory('D:\a\_temp\54b9d1de-b670-4f38-b526-9cc15ee8396f', 'D:\a\_temp\4b3f541f-4244-4543-93cb-9bbede80fbea', $true) } catch { if (($_.Exception.GetType().FullName -eq 'System.Management.Automation.MethodException') -or ($_.Exception.GetType().FullName -eq 'System.Management.Automation.RuntimeException') ){ Expand-Archive -LiteralPath 'D:\a\_temp\54b9d1de-b670-4f38-b526-9cc15ee8396f' -DestinationPath 'D:\a\_temp\4b3f541f-4244-4543-93cb-9bbede80fbea' -Force } else { throw $_ } } ;"
+2026-02-08T13:33:23.7302010Z Protoc cached under C:\hostedtoolcache\windows\protoc\v23.4\x64

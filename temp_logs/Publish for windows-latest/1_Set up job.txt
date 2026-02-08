@@ -1,0 +1,36 @@
+﻿2026-02-08T13:32:34.5966987Z Current runner version: '2.331.0'
+2026-02-08T13:32:34.6020852Z ##[group]Runner Image Provisioner
+2026-02-08T13:32:34.6022003Z Hosted Compute Agent
+2026-02-08T13:32:34.6022905Z Version: 20260123.484
+2026-02-08T13:32:34.6023898Z Commit: 6bd6555ca37d84114959e1c76d2c01448ff61c5d
+2026-02-08T13:32:34.6025062Z Build Date: 2026-01-23T19:41:17Z
+2026-02-08T13:32:34.6026658Z Worker ID: {46cd6c6e-be6e-4f7b-9b70-e09289838aa3}
+2026-02-08T13:32:34.6027781Z Azure Region: eastus2
+2026-02-08T13:32:34.6028652Z ##[endgroup]
+2026-02-08T13:32:34.6030674Z ##[group]Operating System
+2026-02-08T13:32:34.6031665Z Microsoft Windows Server 2025
+2026-02-08T13:32:34.6032584Z 10.0.26100
+2026-02-08T13:32:34.6033360Z Datacenter
+2026-02-08T13:32:34.6034104Z ##[endgroup]
+2026-02-08T13:32:34.6034833Z ##[group]Runner Image
+2026-02-08T13:32:34.6035740Z Image: windows-2025
+2026-02-08T13:32:34.6036571Z Version: 20260202.17.1
+2026-02-08T13:32:34.6038275Z Included Software: https://github.com/actions/runner-images/blob/win25/20260202.17/images/windows/Windows2025-Readme.md
+2026-02-08T13:32:34.6041432Z Image Release: https://github.com/actions/runner-images/releases/tag/win25%2F20260202.17
+2026-02-08T13:32:34.6042917Z ##[endgroup]
+2026-02-08T13:32:34.6044644Z ##[group]GITHUB_TOKEN Permissions
+2026-02-08T13:32:34.6047716Z Contents: write
+2026-02-08T13:32:34.6048610Z Metadata: read
+2026-02-08T13:32:34.6049356Z ##[endgroup]
+2026-02-08T13:32:34.6052107Z Secret source: Actions
+2026-02-08T13:32:34.6053168Z Prepare workflow directory
+2026-02-08T13:32:34.6622909Z Prepare all required actions
+2026-02-08T13:32:34.6660070Z Getting action download info
+2026-02-08T13:32:35.0578184Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
+2026-02-08T13:32:35.1727742Z Download action repository 'cachix/install-nix-action@v30' (SHA:08dcb3a5e62fa31e2da3d490afc4176ef55ecd72)
+2026-02-08T13:32:35.4550631Z Download action repository 'cachix/cachix-action@v15' (SHA:ad2ddac53f961de1989924296a1f236fcfbaa4fc)
+2026-02-08T13:32:35.7670899Z Download action repository 'dtolnay/rust-toolchain@stable' (SHA:4be9e76fd7c4901c61fb841f559994984270fce7)
+2026-02-08T13:32:35.9094557Z Download action repository 'Swatinem/rust-cache@v2' (SHA:779680da715d629ac1d338a641029a2f4372abb5)
+2026-02-08T13:32:36.2280729Z Download action repository 'arduino/setup-protoc@v3' (SHA:c65c819552d16ad3c9b72d9dfd5ba5237b9c906b)
+2026-02-08T13:32:36.5589386Z Download action repository 'svenstaro/upload-release-action@v2' (SHA:6b7fa9f267e90b50a19fef07b3596790bb941741)
+2026-02-08T13:32:37.0459998Z Complete job name: Publish for windows-latest

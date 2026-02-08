@@ -1,0 +1,19 @@
+﻿2026-02-08T13:32:59.3228602Z ##[group]Run arduino/setup-protoc@v3
+2026-02-08T13:32:59.3228914Z with:
+2026-02-08T13:32:59.3229314Z   repo-token: ***
+2026-02-08T13:32:59.3229536Z   version: 23.x
+2026-02-08T13:32:59.3229753Z   include-pre-releases: false
+2026-02-08T13:32:59.3229992Z env:
+2026-02-08T13:32:59.3230168Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:59.3230394Z   TMPDIR: /home/runner/work/_temp
+2026-02-08T13:32:59.3230963Z   NIX_USER_CONF_FILES: /home/runner/work/_temp/cachix-daemon-JyVAJr/nix.conf:/home/runner/.config/nix/nix.conf:/etc/xdg/nix/nix.conf
+2026-02-08T13:32:59.3231824Z   CACHIX_DAEMON_DIR: /home/runner/work/_temp/cachix-daemon-JyVAJr
+2026-02-08T13:32:59.3232200Z   CARGO_HOME: /home/runner/.cargo
+2026-02-08T13:32:59.3232456Z   CARGO_INCREMENTAL: 0
+2026-02-08T13:32:59.3232683Z   CARGO_TERM_COLOR: always
+2026-02-08T13:32:59.3232914Z   CACHE_ON_FAILURE: true
+2026-02-08T13:32:59.3233126Z ##[endgroup]
+2026-02-08T13:33:03.0543028Z Getting protoc version: v23.4
+2026-02-08T13:33:03.0558332Z Downloading archive: https://github.com/protocolbuffers/protobuf/releases/download/v23.4/protoc-23.4-linux-x86_64.zip
+2026-02-08T13:33:03.2309126Z [command]/usr/bin/unzip -o -q /home/runner/work/_temp/df31d7f1-3502-4976-b71a-65706f9d0cd6
+2026-02-08T13:33:03.3152298Z Protoc cached under /opt/hostedtoolcache/protoc/v23.4/x64

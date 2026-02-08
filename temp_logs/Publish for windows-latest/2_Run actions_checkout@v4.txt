@@ -1,0 +1,77 @@
+﻿2026-02-08T13:32:37.2056678Z ##[group]Run actions/checkout@v4
+2026-02-08T13:32:37.2058070Z with:
+2026-02-08T13:32:37.2058802Z   repository: Barthmalemew/mandrid
+2026-02-08T13:32:37.2059986Z   token: ***
+2026-02-08T13:32:37.2060706Z   ssh-strict: true
+2026-02-08T13:32:37.2061418Z   ssh-user: git
+2026-02-08T13:32:37.2062199Z   persist-credentials: true
+2026-02-08T13:32:37.2063027Z   clean: true
+2026-02-08T13:32:37.2063818Z   sparse-checkout-cone-mode: true
+2026-02-08T13:32:37.2064740Z   fetch-depth: 1
+2026-02-08T13:32:37.2065457Z   fetch-tags: false
+2026-02-08T13:32:37.2066201Z   show-progress: true
+2026-02-08T13:32:37.2067382Z   lfs: false
+2026-02-08T13:32:37.2068089Z   submodules: false
+2026-02-08T13:32:37.2068865Z   set-safe-directory: true
+2026-02-08T13:32:37.2069944Z env:
+2026-02-08T13:32:37.2070637Z   RELEASE_TAG: v0.1.5
+2026-02-08T13:32:37.2071386Z ##[endgroup]
+2026-02-08T13:32:37.3904565Z Syncing repository: Barthmalemew/mandrid
+2026-02-08T13:32:37.3907904Z ##[group]Getting Git version info
+2026-02-08T13:32:37.3909456Z Working directory is 'D:\a\mandrid\mandrid'
+2026-02-08T13:32:37.4954838Z [command]"C:\Program Files\Git\bin\git.exe" version
+2026-02-08T13:32:37.6563794Z git version 2.53.0.windows.1
+2026-02-08T13:32:37.6617814Z ##[endgroup]
+2026-02-08T13:32:37.6641357Z Temporarily overriding HOME='D:\a\_temp\30b15bab-9832-4176-8c69-af6c403548d1' before making global git config changes
+2026-02-08T13:32:37.6647298Z Adding repository directory to the temporary git global config as a safe directory
+2026-02-08T13:32:37.6656839Z [command]"C:\Program Files\Git\bin\git.exe" config --global --add safe.directory D:\a\mandrid\mandrid
+2026-02-08T13:32:37.6977073Z Deleting the contents of 'D:\a\mandrid\mandrid'
+2026-02-08T13:32:37.6983905Z ##[group]Initializing the repository
+2026-02-08T13:32:37.6993728Z [command]"C:\Program Files\Git\bin\git.exe" init D:\a\mandrid\mandrid
+2026-02-08T13:32:37.7460013Z Initialized empty Git repository in D:/a/mandrid/mandrid/.git/
+2026-02-08T13:32:37.7509120Z [command]"C:\Program Files\Git\bin\git.exe" remote add origin https://github.com/Barthmalemew/mandrid
+2026-02-08T13:32:37.7866290Z ##[endgroup]
+2026-02-08T13:32:37.7868611Z ##[group]Disabling automatic garbage collection
+2026-02-08T13:32:37.7878308Z [command]"C:\Program Files\Git\bin\git.exe" config --local gc.auto 0
+2026-02-08T13:32:37.8164998Z ##[endgroup]
+2026-02-08T13:32:37.8167115Z ##[group]Setting up auth
+2026-02-08T13:32:37.8179496Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp core\.sshCommand
+2026-02-08T13:32:37.8486221Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :\""
+2026-02-08T13:32:38.7383010Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-02-08T13:32:38.7795915Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :\""
+2026-02-08T13:32:39.3678422Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-02-08T13:32:39.3997302Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "git config --local --show-origin --name-only --get-regexp remote.origin.url"
+2026-02-08T13:32:39.9662416Z [command]"C:\Program Files\Git\bin\git.exe" config --local http.https://github.com/.extraheader "AUTHORIZATION: basic ***"
+2026-02-08T13:32:39.9976698Z ##[endgroup]
+2026-02-08T13:32:39.9977319Z ##[group]Fetching the repository
+2026-02-08T13:32:39.9992665Z [command]"C:\Program Files\Git\bin\git.exe" -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +14881bab4fe4c2fea8cd8cbc6c199a44935b20c8:refs/tags/v0.1.5
+2026-02-08T13:32:40.5176822Z From https://github.com/Barthmalemew/mandrid
+2026-02-08T13:32:40.5181849Z  * [new ref]         14881bab4fe4c2fea8cd8cbc6c199a44935b20c8 -> v0.1.5
+2026-02-08T13:32:40.5355992Z ##[endgroup]
+2026-02-08T13:32:40.5357191Z ##[group]Determining the checkout info
+2026-02-08T13:32:40.5359048Z ##[endgroup]
+2026-02-08T13:32:40.5374991Z [command]"C:\Program Files\Git\bin\git.exe" sparse-checkout disable
+2026-02-08T13:32:40.5723278Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset-all extensions.worktreeConfig
+2026-02-08T13:32:40.6064672Z ##[group]Checking out the ref
+2026-02-08T13:32:40.6087160Z [command]"C:\Program Files\Git\bin\git.exe" checkout --progress --force refs/tags/v0.1.5
+2026-02-08T13:32:40.6589473Z Note: switching to 'refs/tags/v0.1.5'.
+2026-02-08T13:32:40.6610889Z 
+2026-02-08T13:32:40.6612954Z You are in 'detached HEAD' state. You can look around, make experimental
+2026-02-08T13:32:40.6614655Z changes and commit them, and you can discard any commits you make in this
+2026-02-08T13:32:40.6615909Z state without impacting any branches by switching back to a branch.
+2026-02-08T13:32:40.6626545Z 
+2026-02-08T13:32:40.6631358Z If you want to create a new branch to retain commits you create, you may
+2026-02-08T13:32:40.6649259Z do so (now or later) by using -c with the switch command. Example:
+2026-02-08T13:32:40.6658175Z 
+2026-02-08T13:32:40.6661015Z   git switch -c <new-branch-name>
+2026-02-08T13:32:40.6673369Z 
+2026-02-08T13:32:40.6694058Z Or undo this operation with:
+2026-02-08T13:32:40.6697950Z 
+2026-02-08T13:32:40.6698294Z   git switch -
+2026-02-08T13:32:40.6698699Z 
+2026-02-08T13:32:40.6699222Z Turn off this advice by setting config variable advice.detachedHead to false
+2026-02-08T13:32:40.6699881Z 
+2026-02-08T13:32:40.6700486Z HEAD is now at 14881ba ci: force explicit Cachix push to bypass GHA cache restoration
+2026-02-08T13:32:40.6702293Z ##[endgroup]
+2026-02-08T13:32:40.7099858Z [command]"C:\Program Files\Git\bin\git.exe" log -1 --format=%H
+2026-02-08T13:32:40.7463638Z 14881bab4fe4c2fea8cd8cbc6c199a44935b20c8

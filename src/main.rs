@@ -394,7 +394,7 @@ enum Command {
         exclude_types: Vec<String>,
 
         /// Per-type caps for episodic memories (comma-separated, e.g. trace=2,thought=1)
-        #[arg(long, value_delimiter = ',')]
+        #[arg(long, value_delimiter = ',', env = "MEM_PACK_TYPE_CAPS")]
         type_caps: Vec<String>,
 
         /// Enable Cross-Encoder reranking (slower; optional).

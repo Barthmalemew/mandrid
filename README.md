@@ -66,6 +66,9 @@ mem pack "<prompt>" --include-types task,thought --exclude-types trace
 
 # Cap noisy types so they can't crowd out the pack
 mem pack "<prompt>" --type-caps trace=2,thought=1,task=2,auto=2
+
+# Or set a default caps policy
+export MEM_PACK_TYPE_CAPS="trace=2,thought=1,task=2,auto=2"
 ```
 
 4. **Enable automated capture (Shell Hook):**

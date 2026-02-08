@@ -36,6 +36,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -44,9 +45,6 @@ jobs:
           - os: windows-latest
             artifact_name: mem.exe
             asset_name: mandrid-windows-amd64.exe
-          - os: macos-latest
-            artifact_name: mem
-            asset_name: mandrid-macos-amd64
 
     defaults:
       run:

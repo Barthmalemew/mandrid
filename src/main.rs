@@ -268,8 +268,21 @@ enum Command {
         session: Option<String>,
     },
 
+    /// Explain why a symbol exists or was changed (Chesterton's Fence).
+    Why {
+        symbol: String,
+        #[arg(long)]
+        session: Option<String>,
+    },
+
     /// Start a minimal LSP server to receive real-time code changes.
     Lsp,
+
+    /// Sense architectural patterns or smells in the codebase.
+    Sense {
+        #[arg(default_value = "dead-code")]
+        mode: String,
+    },
 
     /// Execute a command and automatically record its output and result to memory.
     Run {
@@ -1505,6 +1518,117 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
             
             if let Some(risk) = check_risk(&table, &query_vec).await? {
                 eprintln!("\n{}", risk);
+            }
+        }
+        Command::Why { symbol, session } => {
+            let table = open_table(&db_path).await?;
+            let _session_id = session.unwrap_or_else(|| "default".to_string());
+
+            // 1. Find the symbol's last update
+            let filter = format!("memory_type = 'code' AND name = '{}'", symbol.replace('\'', "''"));
+            let stream = table.query().only_if(filter).limit(1).execute().await?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+            let symbols = decode_rows(&batches, None)?;
+
+            let symbol_row = match symbols.first() {
+                Some(s) => s,
+                None => {
+                    println!("Symbol '{}' not found in memory.", symbol);
+                    return Ok(());
+                }
+            };
+
+            println!("🕵️ Investigating symbol: {} ({}:{})", symbol, symbol_row.file_path, symbol_row.line_start);
+            println!("Last Modified: {}\n", chrono::DateTime::from_timestamp(symbol_row.mtime_secs as i64, 0)
+                .map(|d| d.to_rfc2822())
+                .unwrap_or_else(|| "unknown".to_string()));
+
+            // 2. Find reasoning traces/thoughts around that time
+            // Look for thoughts within 1 hour of the mtime
+            let window = 3600; // 1 hour
+            let start = symbol_row.mtime_secs.saturating_sub(window);
+            let end = symbol_row.mtime_secs.saturating_add(window);
+
+            let reasoning_filter = format!(
+                "memory_type IN ('thought', 'trace', 'git_reasoning', 'manual') AND created_at >= {} AND created_at <= {}",
+                start, end
+            );
+            let r_stream = table.query().only_if(reasoning_filter).limit(5).execute().await?;
+            let r_batches: Vec<RecordBatch> = r_stream.try_collect().await?;
+            let reasons = decode_rows(&r_batches, None)?;
+
+            if reasons.is_empty() {
+                println!("No specific reasoning traces found within the modification window.");
+                println!("Try searching globally with `mem ask \"why was {} changed?\"`", symbol);
+            } else {
+                println!("=== REASONING TRACES AT TIME OF CHANGE ===");
+                for r in reasons {
+                    println!("\n[{}] ({})", r.tag.unwrap_or_default(), r.memory_type);
+                    // Print first few lines of reasoning
+                    for line in r.text.lines().take(10) {
+                        println!("  {}", line);
+                    }
+                    if r.text.lines().count() > 10 { println!("  ..."); }
+                }
+            }
+        }
+        Command::Sense { mode } => {
+            let table = open_table(&db_path).await?;
+            if mode == "dead-code" {
+                println!("🕵️ Scanning for potential dead code (symbols with 0 incoming references)...");
+                
+                // Get all code symbols
+                let stream = table.query().only_if("memory_type = 'code'").execute().await?;
+                let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                let all_symbols = decode_rows(&batches, None)?;
+
+                let mut dead_symbols = Vec::new();
+                for symbol_row in &all_symbols {
+                    if symbol_row.name.is_empty() || symbol_row.name == "anonymous" { continue; }
+                    
+                    // Check if anything references this name
+                    let impacted = find_impacted(&table, &symbol_row.name).await?;
+                    if impacted.is_empty() {
+                        dead_symbols.push(symbol_row);
+                    }
+                }
+
+                if dead_symbols.is_empty() {
+                    println!("No dead symbols detected. Great job!");
+                } else {
+                    println!("=== POTENTIAL DEAD CODE ===");
+                    for s in dead_symbols {
+                        println!("- {} ({}:{})", s.name, s.file_path, s.line_start);
+                    }
+                }
+            } else if mode == "bottlenecks" {
+                println!("🕵️ Scanning for architectural bottlenecks (symbols referenced by many others)...");
+                
+                let stream = table.query().only_if("memory_type = 'code'").execute().await?;
+                let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                let all_symbols = decode_rows(&batches, None)?;
+
+                let mut counts = Vec::new();
+                for symbol_row in &all_symbols {
+                    if symbol_row.name.is_empty() { continue; }
+                    let impacted = find_impacted(&table, &symbol_row.name).await?;
+                    if impacted.len() > 5 {
+                        counts.push((symbol_row.name.clone(), impacted.len(), symbol_row.file_path.clone()));
+                    }
+                }
+
+                counts.sort_by_key(|c| std::cmp::Reverse(c.1));
+                
+                if counts.is_empty() {
+                    println!("No significant bottlenecks detected.");
+                } else {
+                    println!("=== TOP BOTTLENECKS ===");
+                    for (name, count, path) in counts.iter().take(10) {
+                        println!("- {}: {} references ({})", name, count, path);
+                    }
+                }
+            } else {
+                println!("Unsupported sense mode: {}", mode);
             }
         }
         Command::Lsp => {

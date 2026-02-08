@@ -64,9 +64,35 @@
           '';
         });
 
+        # Fast-path: Download pre-built binary from GitHub
+        mandrid-bin = pkgs.stdenv.mkDerivation rec {
+          pname = "mandrid-bin";
+          version = "0.1.5";
+
+          src = pkgs.fetchurl {
+            url = "https://github.com/Barthmalemew/mandrid/releases/download/v${version}/mandrid-linux-amd64";
+            # This is a placeholder; you'll get a hash error once, then copy the real hash
+            sha256 = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+          };
+
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+          phases = [ "installPhase" ];
+
+          installPhase = ''
+            mkdir -p $out/bin
+            cp $src $out/bin/mem
+            chmod +x $out/bin/mem
+            wrapProgram $out/bin/mem \
+              --set ORT_DYLIB_PATH "${pkgs.onnxruntime}/lib/libonnxruntime.so" \
+              --prefix LD_LIBRARY_PATH : "${pkgs.onnxruntime}/lib" \
+              --set SSL_CERT_FILE "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+          '';
+        };
+
       in {
         packages.default = mandrid;
         packages.mandrid = mandrid;
+        packages.bin = mandrid-bin;
 
         apps.default = flake-utils.lib.mkApp {
           drv = mandrid;

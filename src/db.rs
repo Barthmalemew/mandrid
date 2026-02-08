@@ -99,7 +99,13 @@ pub async fn open_or_create_table(db_path: &Path) -> Result<lancedb::Table> {
     match db.open_table(DEFAULT_TABLE_NAME).execute().await {
         Ok(table) => {
             // Validate schema
-            let actual_schema = table.schema().await?;
+            let actual_schema = match table.schema().await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Warning: Failed to read schema: {}. Re-initializing might be required.", e);
+                    return Ok(table);
+                }
+            };
             let expected_schema = memory_schema();
             
             let actual_fields: std::collections::HashSet<_> = actual_schema.fields().iter().map(|f| f.name()).collect();

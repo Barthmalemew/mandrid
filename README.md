@@ -1,18 +1,17 @@
 # Mandrid (mem) 🦀
 
-**The high-performance, local-first AI memory layer for terminal agents.**
+**A high-performance, local-first structural memory layer for terminal-based development.**
 
-Mandrid is a persistent memory layer designed to give terminal-based AI agents (and human developers) structural understanding, episodic context, and long-horizon memory. It replaces naive search with AST-aware Knowledge Graphs and Hybrid Retrieval.
+Mandrid provides a persistent context layer for developers and autonomous agents. It combines AST-aware code indexing with episodic command tracking to provide a comprehensive project "brain" that remains entirely on-device.
 
-## 🚀 Key Features
+## 🛠 Core Capabilities
 
-- **Polyglot Structural Engine:** AST-aware chunking for Rust, Python, JavaScript/TypeScript, Go, C/C++, Java, and C# using Tree-sitter.
-- **Hybrid Search + Reranking:** Combines Vector Search (LanceDB) with Full-Text Search (FTS), fused via RRF and polished with a local Cross-Encoder reranker.
-- **Knowledge Graph Intelligence:** Tracks symbol relationships (who calls whom?) to calculate the "Blast Radius" of code changes.
-- **Episodic Capture:** Automatically streams terminal commands, exit codes, and git history into searchable "experience."
-- **Negative Memory:** Proactively warns about previous command failures and regression risks.
-- **Unix-Brain Philosophy:** CLI-first, pipe-friendly JSON output, and stateless execution.
-- **Portable & Local:** Everything runs on your CPU. No cloud dependencies. No mandatory IDE plugins.
+- **Structural Indexing:** AST-aware parsing for Rust, Python, Go, C/C++, Java, C#, and JavaScript/TypeScript using Tree-sitter.
+- **Hybrid Retrieval:** Combined Vector Search (LanceDB) and Full-Text Search (FTS), optimized with local Cross-Encoder reranking.
+- **Blast Radius Analysis:** Deterministic tracking of symbol relationships to map the impact of code changes.
+- **Episodic Logging:** Automated capture of terminal sessions, including exit codes and execution telemetry.
+- **Proactive Context:** "Negative memory" system that flags previous failures and anti-patterns during active sessions.
+- **Local Runtime:** Zero cloud dependencies. All embeddings and reranking processes run on the local CPU.
 
 ## 📦 Installation
 
@@ -21,88 +20,64 @@ Mandrid is a persistent memory layer designed to give terminal-based AI agents (
 nix profile install github:Barthmalemew/mandrid
 ```
 
-### Prebuilt binaries
-Download the appropriate binary from GitHub Releases and put it on your `PATH`:
+### Prebuilt Binaries
+Download the latest binary for your architecture from [GitHub Releases](https://github.com/Barthmalemew/mandrid/releases).
 
-- Linux: `mandrid-linux-amd64`
-- macOS: `mandrid-macos-amd64`
-- Windows: `mandrid-windows-amd64.exe`
-
-Releases: https://github.com/Barthmalemew/mandrid/releases
-
-Quick install examples:
-
+**Quick Setup:**
 ```bash
-# Linux/macOS (rename to `mem` and put on PATH)
+# Linux/macOS
 chmod +x ./mandrid-<os>-amd64
 sudo mv ./mandrid-<os>-amd64 /usr/local/bin/mem
+
+# Windows
+# Rename to mem.exe and add the directory to your PATH.
 ```
 
-Windows: rename `mandrid-windows-amd64.exe` to `mem.exe` and add its folder to your user/system `PATH`.
+### Runtime Dependency: ONNX Runtime
+Mandrid utilizes `fastembed` for local inference.
+- **Nix:** Managed automatically.
+- **Manual:** Ensure the ONNX Runtime shared library (`libonnxruntime.so` / `.dylib` / `onnxruntime.dll`) is in your library path.
 
-### Runtime dependency: ONNX Runtime
-Mandrid uses local embedding/reranking via `fastembed` (ONNX Runtime).
+## 🚀 Getting Started
 
-- Nix installs and wires this up automatically.
-- If you install from source or use a raw release binary outside Nix, you must have the ONNX Runtime shared library available.
+1. **Initialize a project:**
+   ```bash
+   mem init --role programmer
+   ```
 
-Common fixes:
+2. **Index the codebase:**
+   ```bash
+   mem learn .
+   ```
 
-- Linux: install `onnxruntime` (distro package) or place `libonnxruntime.so` on `LD_LIBRARY_PATH`.
-- macOS: install `onnxruntime` (Homebrew) or set `ORT_DYLIB_PATH` to the directory containing `libonnxruntime.dylib`.
-- Windows: ensure `onnxruntime.dll` is on `PATH`.
+3. **Enable automated capture (Shell Hook):**
+   Add the following to your shell configuration (`.zshrc`, `.bashrc`, or PowerShell `$PROFILE`):
+   ```bash
+   # Zsh/Bash
+   source <(mem hook zsh) # or bash
+   
+   # PowerShell
+   Invoke-Expression (& mem hook powershell)
+   ```
 
-### From Source
-```bash
-cargo install --locked --path .
-```
+4. **Query the memory:**
+   ```bash
+   mem ask "explain the database connection pooling logic" --rerank
+   ```
 
-## 🛠 Usage
+5. **Analyze impact:**
+   ```bash
+   mem impact handle_request --depth 2
+   ```
 
-### Initialize
-```bash
-mem init --role programmer
-```
+## 🏗 Technical Stack
 
-### Learn your Codebase
-```bash
-mem learn .
-```
-
-### Automated Command Capture (Shell Hook)
-Source the hook in your shell config (`.zshrc`, `.bashrc`, or PowerShell `$PROFILE`):
-```bash
-# Zsh
-source <(mem hook zsh)
-
-# PowerShell
-Invoke-Expression (& mem hook powershell)
-```
-
-### Ask Questions
-```bash
-mem ask "how does the reranking logic work?" --rerank
-```
-
-### Impact Analysis
-See what might break if you change a symbol:
-```bash
-mem impact structural_chunk --depth 3
-```
-
-### Memory Portal (Web UI)
-Launch the local dashboard to browse memories:
-```bash
-mem serve --port 3000
-```
-
-## 🏗 Architecture
-
-Mandrid is built in **Rust** using:
-- **LanceDB:** Serverless vector database for disk-based indexing.
-- **Tree-sitter:** High-fidelity polyglot parsing.
-- **FastEmbed/ONNX:** Local embedding and reranking models.
-- **Axum:** Lightweight dashboard backend.
+Mandrid is implemented in Rust and leverages:
+- **LanceDB:** Serverless vector storage.
+- **Tree-sitter:** Multi-language AST parsing.
+- **ONNX Runtime:** Local model execution for embeddings and reranking.
+- **Axum:** Embedded web server for the visualization dashboard.
 
 ## 📄 License
-MIT / Apache-2.0
+
+Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).

@@ -261,6 +261,13 @@ enum Command {
         session: Option<String>,
     },
 
+    /// Check for potential risks based on previous failures.
+    CheckRisk {
+        command_text: String,
+        #[arg(long)]
+        session: Option<String>,
+    },
+
     /// Start a minimal LSP server to receive real-time code changes.
     Lsp,
 
@@ -1289,6 +1296,24 @@ Your current assigned role: **{}**
                         Json(rows)
                     }),
                 )
+                .route(
+                    "/api/check-risk",
+                    get(|State(state): State<ServeState>, Query(q): Query<SearchQuery>| async move {
+                        let table = match open_table(&state.db_path).await {
+                            Ok(t) => t,
+                            Err(_) => return Json(serde_json::json!({"risk": null})),
+                        };
+
+                        let mut embedder = state.embedder.lock().await;
+                        let query_vec = match embed_prefixed(&mut embedder, "query", &q.q) {
+                            Ok(v) => v,
+                            Err(_) => return Json(serde_json::json!({"risk": null})),
+                        };
+
+                        let risk = check_risk(&table, &query_vec).await.unwrap_or(None);
+                        Json(serde_json::json!({"risk": risk}))
+                    }),
+                )
                 .layer(CorsLayer::permissive())
                 .with_state(state);
 
@@ -1302,10 +1327,15 @@ Your current assigned role: **{}**
 # Mandrid Zsh Hook
 # Source this in your .zshrc: source <(mem hook zsh)
 
-mandrid_preexec() {{
-    export MANDRID_LAST_CMD="$1"
-    export MANDRID_CMD_START=$(date +%s)
-}}
+ mandrid_preexec() {{
+     export MANDRID_LAST_CMD="$1"
+     export MANDRID_CMD_START=$(date +%s)
+     # Risk check before running
+     if [[ "$1" != "mem "* ]]; then
+         mem check-risk "$1"
+     fi
+ }}
+
 
  mandrid_precmd() {{
      local exit_code=$?
@@ -1453,6 +1483,30 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
             }
             println!("\nPlease analyze the error and propose a fix.");
         }
+        Command::CheckRisk { command_text, session: _ } => {
+            if is_server_alive(3000).await {
+                let client = reqwest::Client::new();
+                let resp = client.get("http://localhost:3000/api/check-risk")
+                    .query(&[("q", &command_text)])
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    let body: serde_json::Value = resp.json().await?;
+                    if let Some(risk) = body.get("risk").and_then(|v| v.as_str()) {
+                        eprintln!("\n{}", risk);
+                    }
+                }
+                return Ok(());
+            }
+
+            let table = open_table(&db_path).await?;
+            let mut embedder = init_embedder(cache_dir.clone(), false)?;
+            let query_vec = embed_prefixed(&mut embedder, "query", &command_text)?;
+            
+            if let Some(risk) = check_risk(&table, &query_vec).await? {
+                eprintln!("\n{}", risk);
+            }
+        }
         Command::Lsp => {
             let (connection, io_threads) = Connection::stdio();
             let server_capabilities = serde_json::to_value(&ServerCapabilities {
@@ -1495,6 +1549,14 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
             }
 
             let full_command = command.join(" ");
+            
+            // --- Pre-flight Risk Check ---
+            let _ = tokio::process::Command::new("mem")
+                .args(["check-risk", &full_command])
+                .status()
+                .await;
+            // -----------------------------
+
             println!("🚀 Mandrid running: {}", full_command);
 
             let start_time = SystemTime::now();

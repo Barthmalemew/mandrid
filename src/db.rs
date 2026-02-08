@@ -126,6 +126,30 @@ pub async fn open_table(db_path: &Path) -> Result<lancedb::Table> {
     Ok(db.open_table(DEFAULT_TABLE_NAME).execute().await?)
 }
 
+pub async fn check_risk(
+    table: &lancedb::Table,
+    query_vector: &[f32],
+) -> Result<Option<String>> {
+    let stream = table.query()
+        .nearest_to(query_vector)?
+        .only_if("memory_type = 'trace' AND status = 'failure'")
+        .limit(1)
+        .execute()
+        .await?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+    let rows = decode_rows(&batches, None)?;
+
+    if let Some(best) = rows.first() {
+        let risk_msg = format!(
+            "[Mandrid Warning]: Similar command failed recently.\nCommand: {}\nResult: {}",
+            best.name,
+            best.text.lines().find(|l| l.contains("Exit:") || l.contains("Status:")).unwrap_or("Failed")
+        );
+        return Ok(Some(risk_msg));
+    }
+    Ok(None)
+}
+
 pub fn empty_record_batch(schema: SchemaRef) -> Result<RecordBatch> {
     let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
         std::iter::empty::<Option<Vec<Option<f32>>>>(),

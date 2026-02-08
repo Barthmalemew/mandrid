@@ -50,7 +50,12 @@ Mandrid utilizes `fastembed` for local inference.
    mem learn .
    ```
 
-3. **Enable automated capture (Shell Hook):**
+3. **Get a compact project briefing (agent-friendly):**
+   ```bash
+   mem context --human --compact --scope session
+   ```
+
+4. **Enable automated capture (Shell Hook):**
    Add the following to your shell configuration (`.zshrc`, `.bashrc`, or PowerShell `$PROFILE`):
    ```bash
    # Zsh/Bash
@@ -60,12 +65,12 @@ Mandrid utilizes `fastembed` for local inference.
    Invoke-Expression (& mem hook powershell)
    ```
 
-4. **Query the memory:**
+5. **Query the memory:**
    ```bash
    mem ask "explain the database connection pooling logic" --rerank
    ```
 
-5. **Analyze impact:**
+6. **Analyze impact:**
    ```bash
    mem impact handle_request --depth 2
    ```
@@ -77,6 +82,16 @@ Mandrid is implemented in Rust and leverages:
 - **Tree-sitter:** Multi-language AST parsing.
 - **ONNX Runtime:** Local model execution for embeddings and reranking.
 - **Axum:** Embedded web server for the visualization dashboard.
+
+## 🔧 Upgrades / Rebuild
+
+If you upgrade Mandrid and hit schema/version errors (or indexing/search feels "off"), rebuild the local DB:
+
+```bash
+mem rebuild
+```
+
+This backs up `.mem_db` and regenerates it.
 
 ## 📄 License
 

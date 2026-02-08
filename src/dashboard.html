@@ -1,96 +1,259 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mandrid Memory Portal</title>
+    <title>Mandrid Portal</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/alpinejs" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
-        body { background: #0f172a; color: #f8fafc; }
-        .memory-card:hover { background: #1e293b; }
-        ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: #1e293b; }
-        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+        body { font-family: 'Inter', sans-serif; background: #020617; color: #e2e8f0; }
+        .mono { font-family: 'JetBrains Mono', monospace; }
+        .glass { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(51, 65, 85, 0.5); }
+        .memory-card:hover { border-color: rgba(59, 130, 246, 0.5); transform: translateY(-2px); }
+        #cy { width: 100%; height: 500px; background: #0f172a; border-radius: 0.75rem; border: 1px solid #1e293b; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #0f172a; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
     </style>
 </head>
-<body class="p-4 md:p-8">
-    <div class="max-w-6xl mx-auto">
-        <header class="flex justify-between items-center mb-8 border-b border-slate-700 pb-4">
+<body x-data="portal()" class="antialiased overflow-hidden h-screen flex flex-col">
+    <!-- Header -->
+    <header class="flex-none p-4 glass z-50 flex justify-between items-center px-8 border-b border-slate-800">
+        <div class="flex items-center gap-4">
+            <div class="w-10 h-10 bg-blue-600 rounded-lg flex items-center justify-center font-bold text-white shadow-lg shadow-blue-500/20">M</div>
             <div>
-                <h1 class="text-3xl font-bold text-blue-400">Mandrid Portal</h1>
-                <p class="text-slate-400 text-sm">Local-first AI Memory Dashboard</p>
+                <h1 class="text-xl font-extrabold tracking-tight text-white flex items-center gap-2">
+                    Mandrid <span class="text-blue-500 font-normal">Portal</span>
+                </h1>
+                <p class="text-[10px] uppercase tracking-widest text-slate-500 font-bold">Local Intelligence Layer</p>
             </div>
-            <div class="text-right">
-                <span id="status-badge" class="px-2 py-1 bg-green-900 text-green-300 text-xs rounded border border-green-700">Connected</span>
+        </div>
+        
+        <div class="flex items-center gap-6">
+            <nav class="flex gap-1 bg-slate-900/50 p-1 rounded-lg border border-slate-800">
+                <button @click="tab = 'timeline'" :class="tab === 'timeline' ? 'bg-blue-600 text-white shadow-md' : 'text-slate-400 hover:text-slate-200'" class="px-4 py-1.5 rounded-md text-xs font-semibold transition-all">Timeline</button>
+                <button @click="tab = 'graph'; initGraph()" :class="tab === 'graph' ? 'bg-blue-600 text-white shadow-md' : 'text-slate-400 hover:text-slate-200'" class="px-4 py-1.5 rounded-md text-xs font-semibold transition-all">Graph</button>
+                <button @click="tab = 'senses'" :class="tab === 'senses' ? 'bg-blue-600 text-white shadow-md' : 'text-slate-400 hover:text-slate-200'" class="px-4 py-1.5 rounded-md text-xs font-semibold transition-all">Senses</button>
+            </nav>
+            <div class="h-8 w-px bg-slate-800"></div>
+            <div class="flex flex-col items-end">
+                <div class="flex items-center gap-2">
+                    <span class="w-2 h-2 rounded-full animate-pulse" :class="status === 'online' ? 'bg-green-500' : 'bg-red-500'"></span>
+                    <span class="text-xs font-mono font-medium" x-text="status === 'online' ? 'CONNECTED' : 'DISCONNECTED'"></span>
+                </div>
+                <span class="text-[9px] text-slate-500 mono" x-text="version">v0.1.6</span>
             </div>
-        </header>
+        </div>
+    </header>
 
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            <!-- Sidebar: Filters and Stats -->
-            <div class="space-y-6">
-                <div class="bg-slate-800 p-4 rounded-lg border border-slate-700">
-                    <h2 class="font-semibold mb-4 text-slate-200">Stats</h2>
-                    <div class="grid grid-cols-2 gap-4">
-                        <div class="bg-slate-900 p-3 rounded">
-                            <div class="text-xs text-slate-500 uppercase">Total</div>
-                            <div id="stat-total" class="text-xl font-bold text-blue-300">0</div>
+    <!-- Main Workspace -->
+    <main class="flex-1 overflow-hidden flex gap-0">
+        <!-- Sidebar: Global Filters & Search -->
+        <aside class="w-80 glass flex-none flex flex-col border-r border-slate-800/50">
+            <div class="p-6 space-y-8 flex-1 overflow-y-auto">
+                <!-- Search Section -->
+                <div class="space-y-3">
+                    <label class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Active Workspace</label>
+                    <select x-model="activePath" @change="switchProject($event.target.value)" 
+                        class="w-full bg-slate-950 border border-slate-800 rounded-xl py-3 px-4 text-xs focus:outline-none focus:border-blue-500 transition-all appearance-none cursor-pointer">
+                        <template x-for="p in projects" :key="p.path">
+                            <option :value="p.path" x-text="p.name" :selected="p.path === activePath"></option>
+                        </template>
+                    </select>
+                    <div class="text-[9px] text-slate-600 truncate px-1" x-text="activePath"></div>
+                </div>
+
+                <div class="space-y-3">
+                    <label class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Global Search</label>
+                    <div class="relative">
+                        <input type="text" x-model="searchQuery" @input.debounce.200ms="search()" placeholder="Search project memory..." 
+                            class="w-full bg-slate-950 border border-slate-800 rounded-xl py-3 pl-10 pr-4 text-sm focus:outline-none focus:border-blue-500 transition-all focus:ring-1 focus:ring-blue-500/20">
+                        <span class="absolute left-3 top-3.5 text-slate-600">🔍</span>
+                    </div>
+                    <div class="flex items-center gap-4 px-1">
+                        <label class="flex items-center gap-2 cursor-pointer group">
+                            <input type="checkbox" x-model="rerank" @change="search()" class="sr-only">
+                            <div class="w-8 h-4 bg-slate-800 rounded-full relative transition-colors" :class="rerank ? 'bg-blue-600' : ''">
+                                <div class="w-3 h-3 bg-white rounded-full absolute top-0.5 left-0.5 transition-transform" :class="rerank ? 'translate-x-4' : ''"></div>
+                            </div>
+                            <span class="text-[10px] font-bold text-slate-400 group-hover:text-slate-300">RERANK</span>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Stats Section -->
+                <div class="space-y-3">
+                    <label class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Environment Stats</label>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div class="bg-slate-900/50 p-4 rounded-xl border border-slate-800/50">
+                            <div class="text-2xl font-bold text-white tracking-tight" x-text="stats.total">0</div>
+                            <div class="text-[9px] font-bold text-slate-500 uppercase">Records</div>
                         </div>
-                        <div class="bg-slate-900 p-3 rounded">
-                            <div class="text-xs text-slate-500 uppercase">Tasks</div>
-                            <div id="stat-tasks" class="text-xl font-bold text-orange-300">0</div>
+                        <div class="bg-slate-900/50 p-4 rounded-xl border border-slate-800/50">
+                            <div class="text-2xl font-bold text-white tracking-tight" x-text="stats.failures">0</div>
+                            <div class="text-[9px] font-bold text-red-500/70 uppercase">Failures</div>
                         </div>
                     </div>
                 </div>
 
-                <div class="bg-slate-800 p-4 rounded-lg border border-slate-700">
-                    <h2 class="font-semibold mb-4 text-slate-200">Search</h2>
-                    <input type="text" id="search-input" placeholder="Search memories..." 
-                        class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm focus:outline-none focus:border-blue-500">
+                <!-- Types Filter -->
+                <div class="space-y-3">
+                    <label class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Memory Filters</label>
+                    <div class="flex flex-col gap-1">
+                        <template x-for="type in memoryTypes" :key="type">
+                            <button @click="toggleType(type)" 
+                                :class="activeTypes.includes(type) ? 'bg-blue-500/10 text-blue-400 border-blue-500/20' : 'text-slate-500 border-transparent hover:bg-slate-800/50 hover:text-slate-300'"
+                                class="flex justify-between items-center px-3 py-2 rounded-lg text-xs font-medium border transition-all text-left">
+                                <span x-text="type" class="capitalize"></span>
+                                <span class="text-[10px] opacity-50" x-text="getTypeCount(type)"></span>
+                            </button>
+                        </template>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="p-4 border-t border-slate-800/50 text-[10px] mono text-slate-600 flex justify-between items-center">
+                <span>DB: .mem_db</span>
+                <span x-text="lastUpdate">Just now</span>
+            </div>
+        </aside>
+
+        <!-- Dynamic Content Area -->
+        <section class="flex-1 flex flex-col bg-slate-950/50 overflow-hidden relative">
+            
+            <!-- Timeline Content -->
+            <div x-show="tab === 'timeline'" class="flex-1 overflow-y-auto p-8 space-y-6" x-ref="timelineScroll">
+                <template x-for="(memory, index) in filteredMemories" :key="index">
+                    <div @click="inspectMemory(memory)" class="memory-card glass rounded-2xl p-6 transition-all cursor-pointer group relative overflow-hidden">
+                        <div class="absolute top-0 left-0 w-1 h-full" :class="getTypeBorder(memory.memory_type)"></div>
+                        
+                        <div class="flex justify-between items-start mb-4">
+                            <div class="flex items-center gap-3">
+                                <span class="px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-tighter shadow-sm" :class="getTypeBadge(memory.memory_type)" x-text="memory.memory_type"></span>
+                                <h3 class="text-sm font-bold text-white group-hover:text-blue-400 transition-colors" x-text="memory.name || memory.tag || 'Interaction'"></h3>
+                            </div>
+                            <span class="text-[10px] mono text-slate-500" x-text="formatDate(memory.created_at)"></span>
+                        </div>
+
+                        <div class="bg-black/20 rounded-xl p-4 mono text-[11px] leading-relaxed text-slate-300 border border-white/5 line-clamp-3 group-hover:line-clamp-none transition-all">
+                            <template x-if="memory.memory_type === 'code'">
+                                <span class="text-blue-500 mb-2 block">// Source from <span x-text="memory.file_path"></span></span>
+                            </template>
+                            <span x-text="memory.text"></span>
+                        </div>
+
+                        <div class="mt-4 flex gap-2 overflow-hidden">
+                            <template x-for="ref in parseRefs(memory.references)" :key="ref">
+                                <span class="text-[9px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded-full border border-slate-700" x-text="ref"></span>
+                            </template>
+                        </div>
+                    </div>
+                </template>
+            </div>
+
+            <!-- Graph Content -->
+            <div x-show="tab === 'graph'" class="flex-1 flex flex-col p-8 gap-4 overflow-hidden h-full">
+                <div class="flex justify-between items-center">
+                    <h2 class="text-lg font-bold">Knowledge Graph</h2>
+                    <button @click="initGraph()" class="text-[10px] font-bold bg-slate-800 hover:bg-slate-700 px-3 py-1 rounded-lg transition-all border border-slate-700">REDRAW</button>
+                </div>
+                <div id="cy" class="flex-1 relative shadow-inner">
+                    <div x-show="graphLoading" class="absolute inset-0 flex items-center justify-center bg-slate-950/50 rounded-xl z-10 backdrop-blur-sm">
+                        <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
+                    </div>
                 </div>
             </div>
 
-            <!-- Main Content: Memory List -->
-            <div class="lg:col-span-2 space-y-4">
-                <div class="flex justify-between items-center">
-                    <h2 class="text-xl font-semibold text-slate-200">Recent Memories</h2>
-                    <button id="refresh-btn" class="text-xs bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded transition">Refresh</button>
+            <!-- Senses Content -->
+            <div x-show="tab === 'senses'" class="flex-1 p-8 space-y-8 overflow-y-auto">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div class="glass rounded-2xl p-6 space-y-4">
+                        <div class="flex items-center gap-3">
+                            <div class="w-8 h-8 bg-red-500/10 rounded flex items-center justify-center text-red-500">💀</div>
+                            <h3 class="font-bold">Dead Code Sense</h3>
+                        </div>
+                        <p class="text-xs text-slate-400">Identifying symbols with zero incoming references. These may be safe to delete.</p>
+                        <div class="space-y-2 mt-4">
+                            <template x-for="item in senseData.deadCode" :key="item.name">
+                                <div class="bg-slate-900 p-2 rounded border border-slate-800 flex justify-between items-center">
+                                    <span class="text-xs mono" x-text="item.name"></span>
+                                    <span class="text-[9px] text-slate-600" x-text="item.file"></span>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                    <div class="glass rounded-2xl p-6 space-y-4">
+                        <div class="flex items-center gap-3">
+                            <div class="w-8 h-8 bg-orange-500/10 rounded flex items-center justify-center text-orange-500">🌪️</div>
+                            <h3 class="font-bold">Bottleneck Sense</h3>
+                        </div>
+                        <p class="text-xs text-slate-400">Symbols referenced by many other files. These are your architectural pillars.</p>
+                        <div class="space-y-2 mt-4">
+                            <template x-for="item in senseData.bottlenecks" :key="item.name">
+                                <div class="bg-slate-900 p-2 rounded border border-slate-800 flex justify-between items-center">
+                                    <span class="text-xs mono" x-text="item.name"></span>
+                                    <span class="text-[10px] font-bold text-orange-400" x-text="item.count + ' refs'"></span>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
                 </div>
-                <div id="memory-container" class="space-y-4">
-                    <!-- Memories will be injected here -->
-                    <div class="animate-pulse flex space-x-4 p-4 bg-slate-800 rounded-lg">
-                        <div class="flex-1 space-y-4 py-1">
-                            <div class="h-4 bg-slate-700 rounded w-3/4"></div>
-                            <div class="space-y-2">
-                                <div class="h-4 bg-slate-700 rounded"></div>
-                                <div class="h-4 bg-slate-700 rounded w-5/6"></div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Inspection Modal -->
+    <div x-show="selectedMemory" class="fixed inset-0 bg-black/80 backdrop-blur-md z-[100] flex items-center justify-center p-8" @click.self="selectedMemory = null" x-cloak>
+        <div class="bg-slate-900 border border-slate-800 rounded-3xl max-w-5xl w-full max-h-[85vh] flex flex-col shadow-2xl overflow-hidden">
+            <div class="p-6 border-b border-slate-800 flex justify-between items-center bg-slate-900/50">
+                <div class="flex items-center gap-4">
+                    <span class="px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-widest" :class="getTypeBadge(selectedMemory?.memory_type)" x-text="selectedMemory?.memory_type"></span>
+                    <h3 class="font-bold text-lg text-white" x-text="selectedMemory?.name || selectedMemory?.tag || 'Memory Details'"></h3>
+                </div>
+                <button @click="selectedMemory = null" class="w-10 h-10 flex items-center justify-center rounded-full hover:bg-slate-800 text-slate-400 transition-colors">✕</button>
+            </div>
+            <div class="p-8 overflow-y-auto flex-1 grid grid-cols-1 lg:grid-cols-3 gap-8">
+                <div class="lg:col-span-2 space-y-6">
+                    <div>
+                        <label class="text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-2 block">Content</label>
+                        <div class="bg-black/40 border border-slate-800 rounded-2xl p-6 mono text-xs leading-relaxed text-slate-300 whitespace-pre-wrap select-text" x-text="selectedMemory?.text"></div>
+                    </div>
+                </div>
+                <div class="space-y-6">
+                    <div>
+                        <label class="text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-2 block">Source Metadata</label>
+                        <div class="bg-slate-950/50 rounded-2xl p-4 border border-slate-800 space-y-3">
+                            <div class="flex justify-between items-center border-b border-slate-800/50 pb-2">
+                                <span class="text-[10px] text-slate-500 uppercase font-bold tracking-tight">Location</span>
+                                <span class="text-[11px] mono text-blue-400" x-text="(selectedMemory?.file_path || 'n/a') + ':' + selectedMemory?.line_start"></span>
+                            </div>
+                            <div class="flex justify-between items-center border-b border-slate-800/50 pb-2">
+                                <span class="text-[10px] text-slate-500 uppercase font-bold tracking-tight">Session</span>
+                                <span class="text-[11px] mono text-slate-300" x-text="selectedMemory?.session_id"></span>
+                            </div>
+                            <div class="flex justify-between items-center border-b border-slate-800/50 pb-2">
+                                <span class="text-[10px] text-slate-500 uppercase font-bold tracking-tight">Created At</span>
+                                <span class="text-[11px] mono text-slate-300" x-text="formatDate(selectedMemory?.created_at)"></span>
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <span class="text-[10px] text-slate-500 uppercase font-bold tracking-tight">Status</span>
+                                <span class="text-[11px] mono capitalize" :class="selectedMemory?.status === 'failure' ? 'text-red-400' : 'text-green-400'" x-text="selectedMemory?.status"></span>
                             </div>
                         </div>
                     </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Inspector Modal -->
-    <div id="inspector-modal" class="fixed inset-0 bg-black/50 backdrop-blur-sm hidden flex items-center justify-center p-4">
-        <div class="bg-slate-800 border border-slate-700 rounded-xl max-w-4xl w-full max-h-[90vh] flex flex-col shadow-2xl">
-            <div class="p-4 border-b border-slate-700 flex justify-between items-center">
-                <h3 id="inspector-title" class="font-bold text-blue-300">Memory Details</h3>
-                <button onclick="closeInspector()" class="text-slate-400 hover:text-white">✕</button>
-            </div>
-            <div class="p-6 overflow-y-auto font-mono text-sm space-y-4">
-                <div>
-                    <span class="text-slate-500">Content:</span>
-                    <pre id="inspector-content" class="mt-2 bg-slate-900 p-4 rounded text-slate-300 whitespace-pre-wrap border border-slate-700"></pre>
-                </div>
-                <div class="grid grid-cols-2 gap-4">
                     <div>
-                        <span class="text-slate-500 block mb-1">Metadata:</span>
-                        <div id="inspector-meta" class="bg-slate-900 p-3 rounded text-xs text-slate-400 border border-slate-700 space-y-1"></div>
-                    </div>
-                    <div>
-                        <span class="text-slate-500 block mb-1">References:</span>
-                        <div id="inspector-refs" class="bg-slate-900 p-3 rounded text-xs text-blue-400 border border-slate-700"></div>
+                        <label class="text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-2 block text-center">Reference Graph</label>
+                        <div class="bg-slate-950/50 rounded-2xl p-4 border border-slate-800 space-y-2">
+                            <template x-for="ref in parseRefs(selectedMemory?.references)" :key="ref">
+                                <div class="text-[11px] mono text-blue-400 bg-blue-500/5 px-2 py-1.5 rounded-lg border border-blue-500/10 hover:bg-blue-500/10 transition-colors cursor-default" x-text="'↳ ' + ref"></div>
+                            </template>
+                            <template x-if="!parseRefs(selectedMemory?.references).length">
+                                <div class="text-[10px] text-slate-600 text-center py-4 italic">No external references found</div>
+                            </template>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -98,128 +261,190 @@
     </div>
 
     <script>
-        let allMemories = [];
+        function portal() {
+            return {
+                tab: 'timeline',
+                status: 'online',
+                version: 'v0.1.7',
+                allMemories: [],
+                filteredMemories: [],
+                projects: [],
+                activePath: '',
+                searchQuery: '',
+                rerank: false,
+                lastUpdate: '',
+                selectedMemory: null,
+                activeTypes: ['code', 'task', 'trace', 'thought', 'git_reasoning', 'interaction'],
+                memoryTypes: ['code', 'task', 'trace', 'thought', 'git_reasoning', 'interaction'],
+                graphLoading: false,
+                stats: { total: 0, failures: 0 },
+                senseData: { deadCode: [], bottlenecks: [] },
 
-        async function fetchMemories() {
-            try {
-                const response = await fetch('/api/memories?limit=500');
-                const data = await response.json();
-                allMemories = data;
-                renderMemories(data);
-                updateStats(data);
-            } catch (err) {
-                console.error('Failed to fetch memories:', err);
-                document.getElementById('status-badge').textContent = 'Error';
-                document.getElementById('status-badge').className = 'px-2 py-1 bg-red-900 text-red-300 text-xs rounded border border-red-700';
-            }
-        }
+                init() {
+                    this.fetchData();
+                    setInterval(() => this.fetchData(), 5000);
+                },
 
-        function renderMemories(memories) {
-            const container = document.getElementById('memory-container');
-            if (memories.length === 0) {
-                container.innerHTML = '<div class="text-slate-500 text-center py-8">No memories found. Run some commands or index code!</div>';
-                return;
-            }
+                async fetchData() {
+                    try {
+                        const statusResp = await fetch('/api/status');
+                        const statusJson = await statusResp.json();
+                        this.activePath = statusJson.db_path.replace('/.mem_db', '');
 
-            container.innerHTML = memories.map((m, idx) => `
-                <div onclick="inspectMemory(${idx})" class="memory-card bg-slate-800 p-4 rounded-lg border border-slate-700 cursor-pointer transition shadow-sm group">
-                    <div class="flex justify-between items-start mb-2">
-                        <span class="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded ${getTypeColor(m.memory_type)}">
-                            ${m.memory_type}
-                        </span>
-                        <span class="text-[10px] text-slate-500 font-mono">${new Date(m.created_at * 1000).toLocaleString()}</span>
-                    </div>
-                    <div class="text-sm font-medium text-slate-200 mb-2 truncate group-hover:text-blue-300 transition-colors">
-                        ${m.name || (m.tag && m.tag.replace('code:', '')) || 'Memory'}
-                    </div>
-                    <div class="text-xs text-slate-400 line-clamp-2 font-mono bg-slate-900/50 p-2 rounded">
-                        ${escapeHtml(m.text.substring(0, 200))}
-                    </div>
-                    ${m.references && m.references !== '[]' ? `
-                        <div class="mt-2 flex gap-1 flex-wrap">
-                            ${JSON.parse(m.references).slice(0, 3).map(r => `
-                                <span class="text-[9px] bg-blue-900/30 text-blue-400 px-1.5 py-0.5 rounded border border-blue-800/50">${r}</span>
-                            `).join('')}
-                            ${JSON.parse(m.references).length > 3 ? '<span class="text-[9px] text-slate-500">...</span>' : ''}
-                        </div>
-                    ` : ''}
-                </div>
-            `).join('');
-        }
+                        const projectsResp = await fetch('/api/projects');
+                        this.projects = await projectsResp.json();
 
-        function getTypeColor(type) {
-            switch(type) {
-                case 'code': return 'bg-blue-900 text-blue-300 border border-blue-700';
-                case 'task': return 'bg-orange-900 text-orange-300 border border-orange-700';
-                case 'trace': return 'bg-purple-900 text-purple-300 border border-purple-700';
-                case 'git_reasoning': return 'bg-green-900 text-green-300 border border-green-700';
-                default: return 'bg-slate-700 text-slate-300 border border-slate-600';
-            }
-        }
+                        const resp = await fetch('/api/memories?limit=500');
+                        this.allMemories = await resp.json();
+                        this.updateStats();
+                        this.applyFilters();
+                        this.status = 'online';
+                        this.lastUpdate = new Date().toLocaleTimeString();
+                        
+                        // Extract unique types
+                        const types = [...new Set(this.allMemories.map(m => m.memory_type))];
+                        if (types.length > 0) this.memoryTypes = types;
 
-        function updateStats(memories) {
-            document.getElementById('stat-total').textContent = memories.length;
-            document.getElementById('stat-tasks').textContent = memories.filter(m => m.memory_type === 'task').length;
-        }
+                        // Fetch real sense data
+                        const senseResp = await fetch('/api/senses');
+                        const senseJson = await senseResp.json();
+                        this.senseData.deadCode = senseJson.dead_code || [];
+                        this.senseData.bottlenecks = senseJson.bottlenecks || [];
 
-        function inspectMemory(idx) {
-            const m = allMemories[idx];
-            document.getElementById('inspector-title').textContent = m.tag || m.memory_type;
-            document.getElementById('inspector-content').textContent = m.text;
-            
-            document.getElementById('inspector-meta').innerHTML = `
-                <div><span class="text-slate-600">File:</span> ${m.file_path}:${m.line_start}</div>
-                <div><span class="text-slate-600">Session:</span> ${m.session_id}</div>
-                <div><span class="text-slate-600">Created:</span> ${new Date(m.created_at * 1000).toLocaleString()}</div>
-                <div><span class="text-slate-600">Status:</span> ${m.status}</div>
-            `;
+                    } catch (e) {
+                        this.status = 'offline';
+                    }
+                },
 
-            const refs = JSON.parse(m.references || '[]');
-            document.getElementById('inspector-refs').innerHTML = refs.length > 0 
-                ? refs.map(r => `<div class="mb-1">→ ${r}</div>`).join('')
-                : 'No references extracted';
+                async switchProject(path) {
+                    await fetch(`/api/switch?path=${encodeURIComponent(path)}`, { method: 'POST' });
+                    this.activePath = path;
+                    this.fetchData();
+                },
 
-            document.getElementById('inspector-modal').classList.remove('hidden');
-        }
+                updateStats() {
+                    this.stats.total = this.allMemories.length;
+                    this.stats.failures = this.allMemories.filter(m => m.status === 'failure').length;
+                },
 
-        function closeInspector() {
-            document.getElementById('inspector-modal').classList.add('hidden');
-        }
+                applyFilters() {
+                    this.filteredMemories = this.allMemories.filter(m => 
+                        this.activeTypes.includes(m.memory_type) &&
+                        (m.text.toLowerCase().includes(this.searchQuery.toLowerCase()) || 
+                         (m.name || '').toLowerCase().includes(this.searchQuery.toLowerCase()))
+                    );
+                },
 
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
+                async search() {
+                    if (!this.searchQuery.trim()) {
+                        this.fetchData();
+                        return;
+                    }
+                    const url = `/api/search?q=${encodeURIComponent(this.searchQuery)}&rerank=${this.rerank}&limit=50`;
+                    const resp = await fetch(url);
+                    this.filteredMemories = await resp.json();
+                },
 
-        // Search logic (server-side)
-        let searchTimer = null;
-        document.getElementById('search-input').addEventListener('input', (e) => {
-            const q = e.target.value.trim();
-            if (searchTimer) clearTimeout(searchTimer);
-            searchTimer = setTimeout(async () => {
-                if (!q) {
-                    renderMemories(allMemories);
-                    updateStats(allMemories);
-                    return;
+                toggleType(type) {
+                    if (this.activeTypes.includes(type)) {
+                        this.activeTypes = this.activeTypes.filter(t => t !== type);
+                    } else {
+                        this.activeTypes.push(type);
+                    }
+                    this.applyFilters();
+                },
+
+                getTypeCount(type) {
+                    return this.allMemories.filter(m => m.memory_type === type).length;
+                },
+
+                getTypeBadge(type) {
+                    const colors = {
+                        'code': 'bg-blue-500/20 text-blue-400 border border-blue-500/20',
+                        'task': 'bg-orange-500/20 text-orange-400 border border-orange-500/20',
+                        'trace': 'bg-purple-500/20 text-purple-400 border border-purple-500/20',
+                        'thought': 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/20',
+                        'git_reasoning': 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/20',
+                        'interaction': 'bg-slate-500/20 text-slate-400 border border-slate-500/20'
+                    };
+                    return colors[type] || 'bg-slate-800 text-slate-400';
+                },
+
+                getTypeBorder(type) {
+                    const colors = {
+                        'code': 'bg-blue-500',
+                        'task': 'bg-orange-500',
+                        'trace': 'bg-purple-500',
+                        'thought': 'bg-indigo-500',
+                        'git_reasoning': 'bg-emerald-500'
+                    };
+                    return colors[type] || 'bg-slate-700';
+                },
+
+                formatDate(ts) {
+                    if (!ts) return 'n/a';
+                    return new Date(ts * 1000).toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute:'2-digit'});
+                },
+
+                parseRefs(refs) {
+                    try { return JSON.parse(refs || '[]'); } catch(e) { return []; }
+                },
+
+                inspectMemory(memory) {
+                    this.selectedMemory = memory;
+                },
+
+                async initGraph() {
+                    this.graphLoading = true;
+                    try {
+                        const resp = await fetch('/api/graph');
+                        const data = await resp.json();
+                        
+                        const elements = [
+                            ...data.nodes.map(n => ({ data: { ...n } })),
+                            ...data.edges.map(e => ({ data: { ...e } }))
+                        ];
+
+                        setTimeout(() => {
+                            cytoscape({
+                                container: document.getElementById('cy'),
+                                elements: elements,
+                                style: [
+                                    {
+                                        selector: 'node',
+                                        style: {
+                                            'background-color': '#3b82f6',
+                                            'label': 'data(label)',
+                                            'color': '#e2e8f0',
+                                            'font-size': '10px',
+                                            'text-valign': 'center',
+                                            'text-halign': 'center',
+                                            'width': '40px',
+                                            'height': '40px'
+                                        }
+                                    },
+                                    {
+                                        selector: 'edge',
+                                        style: {
+                                            'width': 1,
+                                            'line-color': '#1e293b',
+                                            'target-arrow-color': '#1e293b',
+                                            'target-arrow-shape': 'triangle',
+                                            'curve-style': 'bezier',
+                                            'opacity': 0.5
+                                        }
+                                    }
+                                ],
+                                layout: { name: 'cose', padding: 50 }
+                            });
+                            this.graphLoading = false;
+                        }, 500);
+                    } catch (e) {
+                        this.graphLoading = false;
+                    }
                 }
-                try {
-                    const resp = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=50`);
-                    const data = await resp.json();
-                    renderMemories(data);
-                    updateStats(data);
-                } catch (err) {
-                    console.error('Search failed:', err);
-                }
-            }, 200);
-        });
-
-        document.getElementById('refresh-btn').addEventListener('click', fetchMemories);
-
-        // Initial fetch
-        fetchMemories();
-        // Auto-refresh every 10s
-        setInterval(fetchMemories, 10000);
+            }
+        }
     </script>
 </body>
 </html>

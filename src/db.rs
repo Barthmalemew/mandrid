@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::fs;
 
 use anyhow::{Context, Result};
 use futures::TryStreamExt;
@@ -14,6 +15,10 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 
 pub const DEFAULT_TABLE_NAME: &str = "memories";
 pub const EMBEDDING_DIMS: i32 = 384;
+
+// Bump this when the on-disk DB needs a rebuild.
+pub const DB_FORMAT_VERSION: u32 = 1;
+const DB_FORMAT_VERSION_FILE: &str = "FORMAT_VERSION";
 
 #[derive(Debug)]
 pub struct MemoryRow {
@@ -91,38 +96,88 @@ pub fn memory_schema() -> SchemaRef {
     ]))
 }
 
-pub async fn open_or_create_table(db_path: &Path) -> Result<lancedb::Table> {
+fn ensure_db_format_version_file(db_path: &Path, enforce: bool) -> Result<()> {
+    let version_path = db_path.join(DB_FORMAT_VERSION_FILE);
+
+    // If it's a brand-new install or a DB created before we introduced format
+    // versioning, we create the marker file and proceed.
+    if !version_path.exists() {
+        if let Err(e) = fs::write(&version_path, format!("{}\n", DB_FORMAT_VERSION)) {
+            // Non-fatal: keep DB usable even if the marker can't be written.
+            eprintln!("Warning: failed to write {}: {}", version_path.display(), e);
+        }
+        return Ok(());
+    }
+
+    if !enforce {
+        return Ok(());
+    }
+
+    let raw = fs::read_to_string(&version_path).unwrap_or_default();
+    let found = raw.trim().parse::<u32>().unwrap_or(0);
+    if found != DB_FORMAT_VERSION {
+        anyhow::bail!(
+            "Mandrid database format version mismatch (found {}, expected {}).\n\
+             Run `mem rebuild` to regenerate the database (or delete `.mem_db`).",
+            found,
+            DB_FORMAT_VERSION
+        );
+    }
+    Ok(())
+}
+
+async fn open_or_create_table_inner(
+    db_path: &Path,
+    enforce_format_version: bool,
+    validate_schema: bool,
+) -> Result<lancedb::Table> {
+    // Ensure the folder exists so FORMAT_VERSION can be written.
+    let _ = fs::create_dir_all(db_path);
+
     let db = lancedb::connect(db_path.to_str().context("Invalid db path")?)
         .execute()
         .await?;
 
     match db.open_table(DEFAULT_TABLE_NAME).execute().await {
         Ok(table) => {
-            // Validate schema
-            let actual_schema = match table.schema().await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Warning: Failed to read schema: {}. Re-initializing might be required.", e);
-                    return Ok(table);
-                }
-            };
-            let expected_schema = memory_schema();
-            
-            let actual_fields: std::collections::HashSet<_> = actual_schema.fields().iter().map(|f| f.name()).collect();
-            let mut missing = Vec::new();
-            for field in expected_schema.fields() {
-                if !actual_fields.contains(field.name()) {
-                    missing.push(field.name().to_string());
-                }
-            }
+            // Check our DB format version marker.
+            // This is separate from the Arrow schema check below.
+            ensure_db_format_version_file(db_path, enforce_format_version)?;
 
-            if !missing.is_empty() {
-                anyhow::bail!(
-                    "Database schema mismatch. Missing fields: {:?}.\n\
-                    The database format has changed to support new features (like Blast Radius and Telemetry).\n\
-                    Please run `rm -rf .mem_db` and re-initialize with `mem init`.",
-                    missing
-                );
+            if validate_schema {
+                // Validate schema
+                let actual_schema = match table.schema().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Failed to read schema: {}. Re-initializing might be required.",
+                            e
+                        );
+                        return Ok(table);
+                    }
+                };
+                let expected_schema = memory_schema();
+
+                let actual_fields: std::collections::HashSet<_> = actual_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name())
+                    .collect();
+                let mut missing = Vec::new();
+                for field in expected_schema.fields() {
+                    if !actual_fields.contains(field.name()) {
+                        missing.push(field.name().to_string());
+                    }
+                }
+
+                if !missing.is_empty() {
+                    anyhow::bail!(
+                        "Database schema mismatch. Missing fields: {:?}.\n\
+                         The database format has changed to support new features (like Blast Radius and Telemetry).\n\
+                         Please run `mem rebuild` (or `rm -rf .mem_db` then `mem init`).",
+                        missing
+                    );
+                }
             }
             Ok(table)
         },
@@ -136,6 +191,8 @@ pub async fn open_or_create_table(db_path: &Path) -> Result<lancedb::Table> {
                 .create_table(DEFAULT_TABLE_NAME, Box::new(batches))
                 .execute()
                 .await?;
+
+            ensure_db_format_version_file(db_path, false)?;
             
             table
                 .create_index(&["text"], Index::FTS(FtsIndexBuilder::default()))
@@ -145,6 +202,140 @@ pub async fn open_or_create_table(db_path: &Path) -> Result<lancedb::Table> {
             Ok(table)
         }
     }
+}
+
+pub async fn open_or_create_table(db_path: &Path) -> Result<lancedb::Table> {
+    open_or_create_table_inner(db_path, true, true).await
+}
+
+// Used for recovery / migration paths where we want to read an older DB even if
+// the format version marker is mismatched.
+// Open an existing DB table without validating schema/version.
+// This is intended for best-effort recovery operations (e.g. `mem rebuild`).
+pub async fn open_table_existing_unchecked(db_path: &Path) -> Result<lancedb::Table> {
+    let db = lancedb::connect(db_path.to_str().context("Invalid db path")?)
+        .execute()
+        .await?;
+    db.open_table(DEFAULT_TABLE_NAME).execute().await.map_err(|e| {
+        anyhow::anyhow!("Failed to open existing table at {}: {}", db_path.display(), e)
+    })
+}
+
+pub fn decode_rows_relaxed(batches: &[RecordBatch], limit: Option<usize>) -> Result<Vec<DecodedRow>> {
+    let mut out = Vec::new();
+
+    for batch in batches {
+        let n = batch.num_rows();
+
+        let tags = batch
+            .column_by_name("tag")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let texts = batch
+            .column_by_name("text")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let types = batch
+            .column_by_name("memory_type")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let paths = batch
+            .column_by_name("file_path")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let lines = batch
+            .column_by_name("line_start")
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt32Array>());
+        let sessions = batch
+            .column_by_name("session_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let names = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let refs = batch
+            .column_by_name("references")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let deps = batch
+            .column_by_name("depends_on")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let statuses = batch
+            .column_by_name("status")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let mtimes = batch
+            .column_by_name("mtime_secs")
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>());
+        let sizes = batch
+            .column_by_name("size_bytes")
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>());
+        let times = batch
+            .column_by_name("created_at")
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>());
+
+        // Some very old DBs may have used a different column name.
+        let created_at_alt = if times.is_none() {
+            batch
+                .column_by_name("timestamp")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>())
+        } else {
+            None
+        };
+
+        for row in 0..n {
+            let tag = tags
+                .and_then(|a| if a.is_null(row) { None } else { Some(a.value(row).to_string()) });
+            let text = texts
+                .map(|a| if a.is_null(row) { String::new() } else { a.value(row).to_string() })
+                .unwrap_or_default();
+            let mem_type = types
+                .map(|a| if a.is_null(row) { "unknown".to_string() } else { a.value(row).to_string() })
+                .unwrap_or_else(|| "unknown".to_string());
+            let path = paths
+                .map(|a| if a.is_null(row) { "unknown".to_string() } else { a.value(row).to_string() })
+                .unwrap_or_else(|| "unknown".to_string());
+            let line = lines.map(|a| a.value(row)).unwrap_or(0);
+            let session = sessions
+                .map(|a| if a.is_null(row) { "default".to_string() } else { a.value(row).to_string() })
+                .unwrap_or_else(|| "default".to_string());
+            let name = names
+                .map(|a| if a.is_null(row) { String::new() } else { a.value(row).to_string() })
+                .unwrap_or_default();
+            let reference = refs
+                .map(|a| if a.is_null(row) { "[]".to_string() } else { a.value(row).to_string() })
+                .unwrap_or_else(|| "[]".to_string());
+            let dep = deps
+                .map(|a| if a.is_null(row) { "[]".to_string() } else { a.value(row).to_string() })
+                .unwrap_or_else(|| "[]".to_string());
+            let status = statuses
+                .map(|a| if a.is_null(row) { "pending".to_string() } else { a.value(row).to_string() })
+                .unwrap_or_else(|| "pending".to_string());
+            let mtime = mtimes.map(|a| a.value(row)).unwrap_or(0);
+            let size = sizes.map(|a| a.value(row)).unwrap_or(0);
+            let created_at = times
+                .map(|a| a.value(row))
+                .or_else(|| created_at_alt.map(|a| a.value(row)))
+                .unwrap_or(0);
+
+            out.push(DecodedRow {
+                tag,
+                text,
+                memory_type: mem_type,
+                file_path: path,
+                line_start: line,
+                session_id: session,
+                name,
+                references: reference,
+                depends_on: dep,
+                status,
+                mtime_secs: mtime,
+                size_bytes: size,
+                created_at,
+            });
+
+            if let Some(limit) = limit {
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 pub async fn open_table(db_path: &Path) -> Result<lancedb::Table> {
@@ -235,10 +426,12 @@ pub async fn ask_hybrid(
     query_vector: &[f32],
     query_text: &str,
     limit: usize,
+    vector_only: bool,
     cache_dir: Option<PathBuf>,
+    filter: Option<&str>,
 ) -> Result<Vec<DecodedRow>> {
     let mut reranker = init_reranker(cache_dir, false)?;
-    ask_hybrid_with_reranker(table, query_vector, query_text, limit, &mut reranker).await
+    ask_hybrid_with_reranker(table, query_vector, query_text, limit, vector_only, filter, &mut reranker).await
 }
 
 pub async fn ask_rrf(
@@ -267,15 +460,48 @@ pub async fn ask_rrf(
     decode_rows(&batches, Some(limit))
 }
 
+pub async fn ask_rrf_filtered(
+    table: &lancedb::Table,
+    query_vector: &[f32],
+    query_text: &str,
+    limit: usize,
+    vector_only: bool,
+    filter: &str,
+) -> Result<Vec<DecodedRow>> {
+    use lancedb::index::scalar::FullTextSearchQuery;
+    use lancedb::query::{ExecutableQuery, QueryBase};
+    use lancedb::rerankers::rrf::RRFReranker;
+
+    let query_builder = table.query().nearest_to(query_vector)?.only_if(filter);
+    let stream = if vector_only {
+        query_builder.limit(limit).execute().await?
+    } else {
+        query_builder
+            .full_text_search(FullTextSearchQuery::new(query_text.to_owned()))
+            .rerank(Arc::new(RRFReranker::default()))
+            .limit(limit)
+            .execute()
+            .await?
+    };
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+    decode_rows(&batches, Some(limit))
+}
+
 pub async fn ask_hybrid_with_reranker(
     table: &lancedb::Table,
     query_vector: &[f32],
     query_text: &str,
     limit: usize,
+    vector_only: bool,
+    filter: Option<&str>,
     reranker: &mut TextRerank,
 ) -> Result<Vec<DecodedRow>> {
     // Phase A: Hybrid retrieval (Vector + FTS fused via RRF)
-    let mut results = ask_rrf(table, query_vector, query_text, 50, false).await?;
+    let mut results = if let Some(f) = filter {
+        ask_rrf_filtered(table, query_vector, query_text, 50, vector_only, f).await?
+    } else {
+        ask_rrf(table, query_vector, query_text, 50, vector_only).await?
+    };
     if results.is_empty() {
         return Ok(results);
     }

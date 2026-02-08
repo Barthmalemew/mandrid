@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use fastembed::{TextEmbedding, TextRerank};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -44,6 +44,19 @@ use crate::task::*;
 
 const DEFAULT_DB_DIR: &str = ".mem_db";
 
+#[derive(ValueEnum, Clone, Debug)]
+enum ContextScope {
+    Session,
+    Project,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum AskScope {
+    All,
+    Code,
+    Episodic,
+}
+
 fn find_project_root() -> Option<PathBuf> {
     let mut curr = std::env::current_dir().ok()?;
     loop {
@@ -55,6 +68,46 @@ fn find_project_root() -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn register_project(path: &Path) -> Result<()> {
+    let config_dir = dirs::config_dir()
+        .map(|p| p.join("mandrid"))
+        .unwrap_or_else(|| PathBuf::from(".mandrid_config"));
+    
+    if !config_dir.exists() {
+        let _ = fs::create_dir_all(&config_dir);
+    }
+    
+    let registry_path = config_dir.join("projects.json");
+    let mut projects: Vec<String> = if registry_path.exists() {
+        serde_json::from_str(&fs::read_to_string(&registry_path).unwrap_or_else(|_| "[]".to_string())).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    
+    let abs_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path_str = abs_path.to_string_lossy().to_string();
+    if !projects.contains(&path_str) {
+        projects.push(path_str);
+        let _ = fs::write(registry_path, serde_json::to_string_pretty(&projects)?);
+    }
+    Ok(())
+}
+
+fn get_registered_projects() -> Vec<PathBuf> {
+    let config_dir = dirs::config_dir().map(|p| p.join("mandrid"));
+    if let Some(dir) = config_dir {
+        let registry_path = dir.join("projects.json");
+        if registry_path.exists() {
+            if let Ok(content) = fs::read_to_string(registry_path) {
+                if let Ok(projects) = serde_json::from_str::<Vec<String>>(&content) {
+                    return projects.into_iter().map(PathBuf::from).filter(|p| p.exists()).collect();
+                }
+            }
+        }
+    }
+    Vec::new()
 }
 
 #[derive(Parser, Debug)]
@@ -120,6 +173,15 @@ enum Command {
     Capture {
         /// The reasoning or explanation for the current state/changes
         reasoning: String,
+
+        /// Limit captured diff to these paths (repeatable).
+        #[arg(long)]
+        paths: Vec<PathBuf>,
+
+        /// Truncate captured diff to this many bytes.
+        #[arg(long)]
+        max_bytes: Option<usize>,
+
         #[arg(long)]
         session: Option<String>,
     },
@@ -136,6 +198,21 @@ enum Command {
         /// Output in a more human-friendly format
         #[arg(long)]
         human: bool,
+        /// Reduce token usage by truncating each entry.
+        #[arg(long)]
+        compact: bool,
+        /// Show only a tiny 1-line summary of the current state.
+        #[arg(long)]
+        summary: bool,
+        /// Context scope (session-only or project-wide).
+        #[arg(long, value_enum, default_value = "project")]
+        scope: ContextScope,
+        /// Maximum estimated tokens for the output.
+        #[arg(long)]
+        token_budget: Option<usize>,
+        /// Include code chunks in the returned context.
+        #[arg(long)]
+        include_code: bool,
         /// Output in machine-readable JSON format
         #[arg(long)]
         json: bool,
@@ -162,7 +239,35 @@ enum Command {
         /// Role of the AI agent (programmer or assistant)
         #[arg(long, default_value = "programmer")]
         role: String,
+
+        /// Optional Project ID (generated if not provided)
+        #[arg(long)]
+        id: Option<String>,
     },
+
+    /// Rebuild the local database after a significant Mandrid update.
+    ///
+    /// This backs up `.mem_db`, creates a fresh DB, optionally re-imports
+    /// episodic memories (thoughts/traces/tasks), and optionally re-learns code.
+    Rebuild {
+        /// Re-import non-code memories from the backup DB.
+        #[arg(long, default_value_t = true)]
+        preserve_episodic: bool,
+
+        /// Skip re-learning the code index.
+        #[arg(long)]
+        skip_learn: bool,
+
+        /// Root dir for code re-learning (default: .)
+        #[arg(long, default_value = ".")]
+        root_dir: PathBuf,
+
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+    },
+
+    /// Diagnose Mandrid DB issues and suggest fixes.
+    Doctor,
 
     /// Ingest a single code file.
     Digest {
@@ -192,6 +297,10 @@ enum Command {
         #[arg(long)]
         vector_only: bool,
 
+        /// Restrict search scope.
+        #[arg(long, value_enum, default_value = "all")]
+        scope: AskScope,
+
         /// Boost results relevant to the current active task
         #[arg(long)]
         task_aware: bool,
@@ -199,6 +308,53 @@ enum Command {
         /// Enable Cross-Encoder Reranking for hyper-precision
         #[arg(long)]
         rerank: bool,
+    },
+
+    /// Build a tiny, token-budgeted context pack for agent runners.
+    Pack {
+        /// Input/query string used for retrieval.
+        #[arg(allow_hyphen_values = true)]
+        input: String,
+
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Context scope (session-only or project-wide).
+        #[arg(long, value_enum, default_value = "session")]
+        scope: ContextScope,
+
+        /// Maximum estimated tokens for the output.
+        #[arg(long, default_value_t = 800)]
+        token_budget: usize,
+
+        /// Number of episodic memories to include.
+        #[arg(long, default_value_t = 2)]
+        k_episodic: usize,
+
+        /// Number of code chunks to include (requires --include-code).
+        #[arg(long, default_value_t = 2)]
+        k_code: usize,
+
+        /// Include code chunks (memory_type=code) in the pack.
+        #[arg(long)]
+        include_code: bool,
+
+        /// Include long-form captured reasoning entries (memory_type=reasoning).
+        /// Off by default to keep packs small.
+        #[arg(long)]
+        include_reasoning: bool,
+
+        /// Enable Cross-Encoder reranking (slower; optional).
+        #[arg(long)]
+        rerank: bool,
+
+        /// Disable Hybrid Search (use vector only).
+        #[arg(long)]
+        vector_only: bool,
+
+        /// Output in machine-readable JSON format.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Inspect the local LanceDB memory store.
@@ -246,7 +402,14 @@ enum Command {
     Serve {
         #[arg(long, default_value_t = 3000)]
         port: u16,
+
+        /// Run in the background as a daemon.
+        #[arg(long)]
+        background: bool,
     },
+
+    /// Stop the background daemon if running.
+    Stop,
 
     /// Generate shell hooks for automated command capture.
     Hook {
@@ -284,6 +447,13 @@ enum Command {
         mode: String,
     },
 
+    /// Tools schema for AI agents.
+    Tools {
+        /// Format (json, markdown)
+        #[arg(long, default_value = "markdown")]
+        format: String,
+    },
+
     /// Execute a command and automatically record its output and result to memory.
     Run {
         #[arg(trailing_var_arg = true)]
@@ -294,6 +464,32 @@ enum Command {
         #[arg(long)]
         note: Option<String>,
     },
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PackJsonItem {
+    tag: Option<String>,
+    memory_type: String,
+    file_path: Option<String>,
+    line_start: Option<u32>,
+    session_id: Option<String>,
+    name: Option<String>,
+    created_at: u64,
+    text: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PackJsonPayload {
+    role: String,
+    session_id: String,
+    scope: String,
+    token_budget: usize,
+    input: String,
+    active_task_title: Option<String>,
+    last_failure: Option<String>,
+    episodic: Vec<PackJsonItem>,
+    code: Vec<PackJsonItem>,
+    pack: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -315,7 +511,7 @@ struct AskJsonPayload {
 
 #[derive(Clone)]
 struct ServeState {
-    db_path: PathBuf,
+    active_db_path: Arc<Mutex<PathBuf>>,
     cache_dir: Option<PathBuf>,
     embedder: Arc<Mutex<TextEmbedding>>,
     reranker: Arc<Mutex<Option<TextRerank>>>,
@@ -378,6 +574,156 @@ async fn is_server_alive(port: u16) -> bool {
         .is_ok()
 }
 
+fn get_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn get_origin_tag(tag: &str) -> String {
+    format!("[{}] {}", get_hostname(), tag)
+}
+
+fn escape_lancedb_str(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut it = s.chars();
+    let mut out = String::new();
+    for _ in 0..max_chars {
+        if let Some(c) = it.next() {
+            out.push(c);
+        } else {
+            return out;
+        }
+    }
+    out.push_str("...");
+    out
+}
+
+fn scope_to_str(scope: &ContextScope) -> &'static str {
+    match scope {
+        ContextScope::Session => "session",
+        ContextScope::Project => "project",
+    }
+}
+
+fn to_pack_item(row: &DecodedRow, max_chars: usize, include_location: bool) -> PackJsonItem {
+    PackJsonItem {
+        tag: row.tag.clone(),
+        memory_type: row.memory_type.clone(),
+        file_path: if include_location {
+            Some(row.file_path.clone())
+        } else {
+            None
+        },
+        line_start: if include_location { Some(row.line_start) } else { None },
+        session_id: Some(row.session_id.clone()),
+        name: if row.name.is_empty() { None } else { Some(row.name.clone()) },
+        created_at: row.created_at,
+        text: truncate_chars(row.text.trim(), max_chars),
+    }
+}
+
+fn build_pack_text(
+    role: &str,
+    session_id: &str,
+    scope: &ContextScope,
+    token_budget: usize,
+    input: &str,
+    active_task_title: Option<&str>,
+    last_failure: Option<&str>,
+    episodic: &[DecodedRow],
+    code: &[DecodedRow],
+) -> String {
+    let budget_chars = token_budget.saturating_mul(4);
+    let mut out = String::new();
+
+    // Always include mandatory fields.
+    out.push_str("<mem_pack>\n");
+    out.push_str(&format!("role: {}\n", role));
+    out.push_str(&format!("session: {}\n", session_id));
+    out.push_str(&format!("scope: {}\n", scope_to_str(scope)));
+    out.push_str(&format!(
+        "task: {}\n",
+        active_task_title.unwrap_or("none")
+    ));
+    out.push_str(&format!("last_failure: {}\n", last_failure.unwrap_or("none")));
+    out.push_str(&format!("input: {}\n", truncate_chars(input.trim(), 240)));
+
+    // If even the header exceeds the budget, stop here (mandatory content already emitted).
+    if out.len() > budget_chars {
+        out.push_str("</mem_pack>\n");
+        return out;
+    }
+
+    let try_push = |s: &str, out: &mut String| -> bool {
+        if out.len().saturating_add(s.len()) > budget_chars {
+            return false;
+        }
+        out.push_str(s);
+        true
+    };
+
+    if !episodic.is_empty() {
+        if !try_push("\n[episodic]\n", &mut out) {
+            out.push_str("</mem_pack>\n");
+            return out;
+        }
+
+        for r in episodic {
+            let tag = r.tag.as_deref().unwrap_or("unknown");
+            let first = r.text.lines().next().unwrap_or("").trim();
+            let item = format!(
+                "- {} ({}) {}\n",
+                tag,
+                r.memory_type,
+                truncate_chars(first, 220)
+            );
+            if !try_push(&item, &mut out) {
+                out.push_str("\n[...budget exceeded...]\n");
+                out.push_str("</mem_pack>\n");
+                return out;
+            }
+        }
+    }
+
+    if !code.is_empty() {
+        if !try_push("\n[code]\n", &mut out) {
+            out.push_str("</mem_pack>\n");
+            return out;
+        }
+
+        for r in code {
+            let name = if r.name.is_empty() { "" } else { &r.name };
+            let header = if name.is_empty() {
+                format!("- {}:{}\n", r.file_path, r.line_start)
+            } else {
+                format!("- {}:{} {}\n", r.file_path, r.line_start, name)
+            };
+            if !try_push(&header, &mut out) {
+                out.push_str("\n[...budget exceeded...]\n");
+                out.push_str("</mem_pack>\n");
+                return out;
+            }
+            let snippet = truncate_chars(r.text.trim(), 520);
+            let body = format!("{}\n", snippet);
+            if !try_push(&body, &mut out) {
+                out.push_str("\n[...budget exceeded...]\n");
+                out.push_str("</mem_pack>\n");
+                return out;
+            }
+        }
+    }
+
+    out.push_str("</mem_pack>\n");
+    out
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -396,7 +742,7 @@ async fn main() -> Result<()> {
             let row = MemoryRow {
                 vector: embedding,
                 text,
-                tag,
+                tag: get_origin_tag(&tag),
                 memory_type: "manual".to_string(),
                 file_path: "manual".to_string(),
                 line_start: 0,
@@ -437,7 +783,7 @@ async fn main() -> Result<()> {
             let row = MemoryRow {
                 vector: embedding,
                 text,
-                tag,
+                tag: get_origin_tag(&tag),
                 memory_type: memory_type.clone(),
                 file_path: file_path.unwrap_or_else(|| default_path.to_string()),
                 line_start: 0,
@@ -554,17 +900,38 @@ async fn main() -> Result<()> {
             table.delete(&filter).await?;
             println!("🗑️ Deleted old episodic traces.");
         }
-        Command::Capture { reasoning, session } => {
+        Command::Capture { reasoning, paths, max_bytes, session } => {
             let mut embedder = init_embedder(cache_dir.clone(), true)?;
             let table = open_or_create_table(&db_path).await?;
 
-            let output = tokio::process::Command::new("git")
-                .args(["diff", "HEAD"])
+            let mut cmd = tokio::process::Command::new("git");
+            cmd.arg("diff").arg("HEAD");
+            if !paths.is_empty() {
+                cmd.arg("--");
+                for p in &paths {
+                    cmd.arg(p);
+                }
+            }
+
+            let output = cmd
                 .current_dir(&project_root)
                 .output()
                 .await
                 .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
                 .unwrap_or_else(|_| "No git diff available".to_string());
+
+            let output = if let Some(max) = max_bytes {
+                if output.len() > max {
+                    let mut out = output;
+                    out.truncate(max);
+                    out.push_str("\n\n... [diff truncated] ...\n");
+                    out
+                } else {
+                    output
+                }
+            } else {
+                output
+            };
 
             let full_text = format!("Reasoning: {}\n\nChanges:\n{}", reasoning, output);
             let embedding = embed_prefixed(&mut embedder, "passage", &full_text)?;
@@ -587,42 +954,148 @@ async fn main() -> Result<()> {
                 created_at: now,
             };
             add_rows(&table, vec![row]).await?;
-            println!("Context captured");
+            println!("Memory captured.");
         }
-        Command::Context { session, limit, file, human, json } => {
+
+        Command::Context {
+            session,
+            limit,
+            file,
+            human,
+            compact,
+            summary,
+            scope,
+            token_budget,
+            include_code,
+            json,
+        } => {
             let table = open_table(&db_path).await.with_context(|| {
-                format!("Database not found at {}. Run `mem init` first.", db_path.display())
+                format!(
+                    "Database not found at {}. Run `mem init` first.",
+                    db_path.display()
+                )
             })?;
 
             let session_id = session.unwrap_or_else(|| "default".to_string());
-            
+
             // 1. Get Project Role/Config
-            let config_stream = table.query().only_if("memory_type = 'system_config'").execute().await?;
+            let config_stream = table
+                .query()
+                .only_if("memory_type = 'system_config'")
+                .execute()
+                .await?;
             let config_batches: Vec<RecordBatch> = config_stream.try_collect().await?;
             let config_rows = decode_rows(&config_batches, None)?;
-            let role = config_rows.first().map(|r| r.text.as_str()).unwrap_or("programmer");
+            let role = config_rows
+                .first()
+                .map(|r| r.text.as_str())
+                .unwrap_or("programmer");
+
+            if summary {
+                // Fetch just enough for a summary
+                let task_stream = table
+                    .query()
+                    .only_if("memory_type = 'task' AND status = 'active'")
+                    .limit(1)
+                    .execute()
+                    .await?;
+                let task_batches: Vec<RecordBatch> = task_stream.try_collect().await?;
+                let active_tasks = decode_rows(&task_batches, None)?;
+
+                let fail_stream = table
+                    .query()
+                    .only_if("memory_type = 'trace' AND status = 'failure'")
+                    .limit(1)
+                    .execute()
+                    .await?;
+                let fail_batches: Vec<RecordBatch> = fail_stream.try_collect().await?;
+                let last_fail = decode_rows(&fail_batches, None)?;
+
+                let task_text = active_tasks
+                    .first()
+                    .map(|t| t.text.chars().take(40).collect::<String>())
+                    .unwrap_or_else(|| "none".to_string());
+                let fail_text = last_fail
+                    .first()
+                    .map(|f| f.name.chars().take(20).collect::<String>())
+                    .unwrap_or_else(|| "none".to_string());
+
+                println!(
+                    "Mandrid: Role={}, Session={}, Task={}, LastFail={}",
+                    role, session_id, task_text, fail_text
+                );
+                return Ok(());
+            }
 
             // 2. Get Active Task(s)
-            let task_stream = table.query().only_if("memory_type = 'task' AND status = 'active'").execute().await?;
+            let task_filter = if matches!(scope, ContextScope::Session) {
+                format!(
+                    "memory_type = 'task' AND status = 'active' AND session_id = '{}'",
+                    session_id.replace('\'', "''")
+                )
+            } else {
+                "memory_type = 'task' AND status = 'active'".to_string()
+            };
+            let task_stream = table.query().only_if(task_filter).execute().await?;
             let task_batches: Vec<RecordBatch> = task_stream.try_collect().await?;
             let active_tasks = decode_rows(&task_batches, None)?;
 
             // 3. Get Recent Thoughts
-            let thought_stream = table.query().only_if("memory_type = 'thought' AND status = 'active'").limit(5).execute().await?;
+            let thought_filter = if matches!(scope, ContextScope::Session) {
+                format!(
+                    "memory_type = 'thought' AND status = 'active' AND session_id = '{}'",
+                    session_id.replace('\'', "''")
+                )
+            } else {
+                "memory_type = 'thought' AND status = 'active'".to_string()
+            };
+            let thought_stream = table
+                .query()
+                .only_if(thought_filter)
+                .limit(5)
+                .execute()
+                .await?;
             let thought_batches: Vec<RecordBatch> = thought_stream.try_collect().await?;
             let active_thoughts = decode_rows(&thought_batches, None)?;
 
             // 4. Get Recent Failures (Negative Memory)
-            let failure_stream = table.query().only_if("memory_type = 'trace' AND status = 'failure'").limit(3).execute().await?;
+            let failure_filter = if matches!(scope, ContextScope::Session) {
+                format!(
+                    "memory_type = 'trace' AND status = 'failure' AND session_id = '{}'",
+                    session_id.replace('\'', "''")
+                )
+            } else {
+                "memory_type = 'trace' AND status = 'failure'".to_string()
+            };
+            let failure_stream = table
+                .query()
+                .only_if(failure_filter)
+                .limit(3)
+                .execute()
+                .await?;
             let failure_batches: Vec<RecordBatch> = failure_stream.try_collect().await?;
             let recent_failures = decode_rows(&failure_batches, None)?;
 
-            let mut filter = format!("(session_id = '{}' OR memory_type = 'manual' OR memory_type = 'task' OR memory_type = 'thought')", session_id.replace('\'', "''"));
-            
+            let mut filter = if matches!(scope, ContextScope::Session) {
+                format!("session_id = '{}'", session_id.replace('\'', "''"))
+            } else {
+                format!(
+                    "(session_id = '{}' OR memory_type = 'manual' OR memory_type = 'task' OR memory_type = 'thought')",
+                    session_id.replace('\'', "''")
+                )
+            };
+            if !include_code {
+                filter.push_str(" AND memory_type != 'code'");
+            }
+            filter.push_str(" AND memory_type != 'system_config'");
+
             if let Some(ref f) = file {
                 let abs_path = fs::canonicalize(f).unwrap_or(f.clone());
                 let rel_path = abs_path.strip_prefix(&project_root).unwrap_or(&abs_path);
-                filter.push_str(&format!(" AND (file_path = '{}' OR memory_type = 'manual' OR memory_type = 'task' OR memory_type = 'thought')", rel_path.display().to_string().replace('\'', "''")));
+                filter.push_str(&format!(
+                    " AND (file_path = '{}' OR memory_type = 'manual' OR memory_type = 'task' OR memory_type = 'thought')",
+                    rel_path.display().to_string().replace('\'', "''")
+                ));
             }
 
             // --- IMPROVED: Task-Relevant Context Injection ---
@@ -630,18 +1103,41 @@ async fn main() -> Result<()> {
             let recent_limit = (limit as f32 * 0.7) as usize;
             let semantic_limit = limit - recent_limit;
 
-            let stream = table.query().only_if(filter.clone()).limit(recent_limit).execute().await?;
+            // Pull a bit more than needed, then sort by created_at for true recency.
+            let fetch_limit = std::cmp::max(recent_limit.saturating_mul(5), recent_limit);
+            let stream = table
+                .query()
+                .only_if(filter.clone())
+                .limit(fetch_limit)
+                .execute()
+                .await?;
             let batches: Vec<RecordBatch> = stream.try_collect().await?;
             let mut rows = decode_rows(&batches, None)?;
+            rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            rows.truncate(recent_limit);
 
             // If we have an active task, pull in semantically relevant historical memories
             if !active_tasks.is_empty() && semantic_limit > 0 {
                 let mut embedder = init_embedder(cache_dir.clone(), false)?;
                 let task_text = &active_tasks[0].text;
                 let task_vec = embed_prefixed(&mut embedder, "query", task_text)?;
-                
+
                 // Search for relevant memories that AREN'T already in the recent list
-                let semantic_results = ask_rrf(&table, &task_vec, task_text, semantic_limit + rows.len(), false).await?;
+                let semantic_fetch = semantic_limit + rows.len();
+                let semantic_filter = if include_code {
+                    "memory_type != 'system_config'".to_string()
+                } else {
+                    "memory_type != 'code' AND memory_type != 'system_config'".to_string()
+                };
+                let semantic_results = ask_rrf_filtered(
+                    &table,
+                    &task_vec,
+                    task_text,
+                    semantic_fetch,
+                    false,
+                    &semantic_filter,
+                )
+                .await?;
                 for sr in semantic_results {
                     if !rows.iter().any(|r| r.text == sr.text) && rows.len() < limit {
                         rows.push(sr);
@@ -656,15 +1152,25 @@ async fn main() -> Result<()> {
                     let chunks = structural_chunk(&content, f);
                     let mut unique_refs = std::collections::HashSet::new();
                     for c in chunks {
-                        for r in c.references { unique_refs.insert(r); }
+                        for r in c.references {
+                            unique_refs.insert(r);
+                        }
                     }
 
                     // For each reference, look up its definition in the DB
                     for r in unique_refs {
                         // Avoid recursion or noise: don't look up common keywords
-                        if r.len() < 3 { continue; }
-                        let ref_filter = format!("memory_type = 'code' AND name = '{}'", r.replace('\'', "''"));
-                        let stream = table.query().only_if(ref_filter).limit(1).execute().await?;
+                        if r.len() < 3 {
+                            continue;
+                        }
+                        let ref_filter =
+                            format!("memory_type = 'code' AND name = '{}'", r.replace('\'', "''"));
+                        let stream = table
+                            .query()
+                            .only_if(ref_filter)
+                            .limit(1)
+                            .execute()
+                            .await?;
                         let batches: Vec<RecordBatch> = stream.try_collect().await?;
                         let mut defs = decode_rows(&batches, None)?;
                         if let Some(def) = defs.pop() {
@@ -690,73 +1196,129 @@ async fn main() -> Result<()> {
                 });
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else if human {
+                println!("<project_context>");
+
                 println!("=== MANDRID STATE SUMMARY ===");
                 println!("Role: {}", role.to_uppercase());
                 println!("Active Session: {}", session_id);
+
+                let mut current_tokens = 0;
+                let budget = token_budget.unwrap_or(2000);
+                let chars_per_token = 4; // conservative estimate
+
+                let mut out_sections = Vec::new();
+
                 if !active_tasks.is_empty() {
-                    println!("\n[Active Tasks]");
-                    for t in active_tasks {
-                        println!("- {}: {}", t.tag.unwrap_or_default(), t.text);
+                    let mut s = "\n[Active Tasks]\n".to_string();
+                    for t in &active_tasks {
+                        s.push_str(&format!("- {}: {}\n", t.tag.as_ref().unwrap_or(&"".to_string()), t.text));
                     }
+                    out_sections.push((10, s)); // Priority 10 (High)
                 }
                 if !active_thoughts.is_empty() {
-                    println!("\n[🧠 BRAIN DUMP]");
+                    let mut s = "\n[🧠 BRAIN DUMP]\n".to_string();
                     for t in &active_thoughts {
-                        println!("- {}", t.text);
+                        s.push_str(&format!("- {}\n", t.text));
                     }
+                    out_sections.push((8, s));
                 }
                 if !recent_failures.is_empty() {
-                    println!("\n## ⚠️ RECENT FAILURES");
+                    let mut s = "\n## ⚠️ RECENT FAILURES\n".to_string();
                     for f in &recent_failures {
-                        println!("- {}: {}", f.tag.as_ref().unwrap_or(&"unknown".to_string()), f.text.lines().next().unwrap_or(""));
+                        s.push_str(&format!("- {}: {}\n", f.tag.as_ref().unwrap_or(&"unknown".to_string()), f.text.lines().next().unwrap_or("")));
                     }
+                    out_sections.push((12, s)); // Highest priority
                 }
 
                 if !external_definitions.is_empty() {
-                    println!("\n## 🕸️ EXTERNAL SYMBOL DEFINITIONS (Referenced in this file)");
-                    for def in external_definitions {
-                        println!("### {} ({}:{})", def.name, def.file_path, def.line_start);
-                        println!("{}", def.text);
+                    let mut s = "\n## 🕸️ EXTERNAL SYMBOL DEFINITIONS (Referenced in this file)\n".to_string();
+                    for def in &external_definitions {
+                        s.push_str(&format!("### {} ({}:{})\n{}\n", def.name, def.file_path, def.line_start, def.text));
                     }
+                    out_sections.push((2, s)); // Low priority
                 }
 
-                println!("\n## Active Session: {}", session_id);
-
-                for row in rows {
+                // Add memories
+                let mut mem_s = format!("\n## Active Session: {}\n", session_id);
+                for row in &rows {
                     if (row.memory_type == "task" || row.memory_type == "thought") && row.status == "active" { continue; }
                     
-                    let header = format!("## {} ({})", row.tag.unwrap_or_else(|| "unknown".to_string()), row.memory_type);
+                    let header = format!("## {} ({})", row.tag.as_ref().unwrap_or(&"unknown".to_string()), row.memory_type);
                     if row.memory_type == "code" {
-                        println!("{} {}:{}", header, row.file_path, row.line_start);
+                        mem_s.push_str(&format!("{} {}:{}\n", header, row.file_path, row.line_start));
                     } else {
-                        println!("{}", header);
+                        mem_s.push_str(&format!("{}\n", header));
                     }
 
-                    // For extremely long reasoning or traces, truncate the middle to preserve tokens
-                    // while keeping the "intent" and "result".
-                    if row.text.len() > 2000 && (row.memory_type == "trace" || row.memory_type == "reasoning") {
+                    if compact {
+                        let lines: Vec<&str> = row.text.lines().collect();
+                        if lines.len() > 12 {
+                            for l in &lines[..12] { mem_s.push_str(l); mem_s.push('\n'); }
+                            mem_s.push_str(&format!("... [{} lines truncated] ...\n", lines.len() - 12));
+                        } else {
+                            mem_s.push_str(&row.text);
+                            mem_s.push('\n');
+                        }
+                    } else if row.text.len() > 2000 && (row.memory_type == "trace" || row.memory_type == "reasoning") {
                         let lines: Vec<&str> = row.text.lines().collect();
                         if lines.len() > 40 {
-                            for line in &lines[..20] { println!("{}", line); }
-                            println!("... [{} lines truncated for token efficiency] ...", lines.len() - 40);
-                            for line in &lines[lines.len()-20..] { println!("{}", line); }
+                            for line in &lines[..20] { mem_s.push_str(line); mem_s.push('\n'); }
+                            mem_s.push_str(&format!("... [{} lines truncated for token efficiency] ...\n", lines.len() - 40));
+                            for line in &lines[lines.len()-20..] { mem_s.push_str(line); mem_s.push('\n'); }
                         } else {
-                            println!("{}", row.text);
+                            mem_s.push_str(&row.text);
+                            mem_s.push('\n');
                         }
                     } else {
-                        println!("{}", row.text);
+                        mem_s.push_str(&row.text);
+                        mem_s.push('\n');
                     }
                 }
+                out_sections.push((5, mem_s));
+
+                // Sort by priority (desc)
+                out_sections.sort_by(|a, b| b.0.cmp(&a.0));
+
+                for (_prio, content) in out_sections {
+                    let section_tokens = content.len() / chars_per_token;
+                    if current_tokens + section_tokens > budget && current_tokens > 0 {
+                        println!("\n[... Context Budget Exceeded ({} tokens) ...]", budget);
+                        break;
+                    }
+                    print!("{}", content);
+                    current_tokens += section_tokens;
+                }
+
                 println!("</project_context>");
             }
         }
-        Command::Init { role } => {
+        Command::Init { role, id } => {
             if !db_path.exists() {
                 fs::create_dir_all(&db_path).context("Failed to create .mem_db")?;
             }
             let table = open_or_create_table(&db_path).await?;
             let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
-            let role_row = MemoryRow {
+            
+            let project_id = id.unwrap_or_else(|| {
+                // Try to read from .mandrid_id first
+                let id_file = project_root.join(".mandrid_id");
+                if id_file.exists() {
+                    fs::read_to_string(id_file).unwrap_or_default().trim().to_string()
+                } else {
+                    let t = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    let new_id = format!("proj_{}", t);
+                    let _ = fs::write(id_file, &new_id);
+                    new_id
+                }
+            });
+
+            let mut rows = Vec::new();
+
+            // Store role
+            rows.push(MemoryRow {
                 vector: vec![0.0; EMBEDDING_DIMS as usize],
                 text: role.clone(),
                 tag: "system:role".to_string(),
@@ -771,9 +1333,28 @@ async fn main() -> Result<()> {
                 mtime_secs: 0,
                 size_bytes: 0,
                 created_at: now,
-            };
+            });
+            
+            // Store project ID
+            rows.push(MemoryRow {
+                vector: vec![0.0; EMBEDDING_DIMS as usize],
+                text: project_id.clone(),
+                tag: "system:project_id".to_string(),
+                memory_type: "system_config".to_string(),
+                file_path: "config".to_string(),
+                line_start: 0,
+                session_id: "global".to_string(),
+                name: String::new(),
+                references: "[]".to_string(),
+                depends_on: "[]".to_string(),
+                status: "active".to_string(),
+                mtime_secs: 0,
+                size_bytes: 0,
+                created_at: now,
+            });
+
             let _ = table.delete("memory_type = 'system_config'").await;
-            add_rows(&table, vec![role_row]).await?;
+            add_rows(&table, rows).await?;
 
             // Setup .gitignore
             let gitignore_path = Path::new(".gitignore");
@@ -801,6 +1382,214 @@ Your current assigned role: **{}**
                 fs::write(agents_md_path, agents_content)?;
             }
             println!("Mandrid initialized with role: {}", role);
+            let _ = register_project(&project_root);
+        }
+        Command::Rebuild { preserve_episodic, skip_learn, root_dir, concurrency } => {
+            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+            let base = db_path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| DEFAULT_DB_DIR.to_string());
+            let backup_path = db_path.with_file_name(format!("{base}.bak.{now}"));
+
+            let mut recovered_role: Option<String> = None;
+            let mut recovered_rows: Vec<DecodedRow> = Vec::new();
+
+            if db_path.exists() {
+                println!("Backing up {} -> {}", db_path.display(), backup_path.display());
+                fs::rename(&db_path, &backup_path).context("Failed to backup existing .mem_db")?;
+
+                if preserve_episodic {
+                    match open_table_existing_unchecked(&backup_path).await {
+                        Ok(old_table) => {
+                            // Recover role (best-effort)
+                            if let Ok(stream) = old_table
+                                .query()
+                                .only_if("tag = 'system:role'")
+                                .limit(1)
+                                .execute()
+                                .await
+                            {
+                                let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap_or_default();
+                                let rows = decode_rows_relaxed(&batches, None).unwrap_or_default();
+                                recovered_role = rows.first().map(|r| r.text.clone());
+                            }
+
+                            // Recover all non-code memories (we re-embed them below).
+                            if let Ok(stream) = old_table
+                                .query()
+                                .only_if("memory_type != 'code' AND memory_type != 'system_config'")
+                                .execute()
+                                .await
+                            {
+                                let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap_or_default();
+                                recovered_rows = decode_rows_relaxed(&batches, None).unwrap_or_default();
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: failed to open backup DB for recovery: {e}");
+                        }
+                    }
+                }
+            }
+
+            fs::create_dir_all(&db_path).context("Failed to create new .mem_db")?;
+            let table = open_or_create_table(&db_path).await?;
+
+            // Determine project_id (prefer .mandrid_id)
+            let id_file = project_root.join(".mandrid_id");
+            let project_id = if id_file.exists() {
+                fs::read_to_string(&id_file).unwrap_or_default().trim().to_string()
+            } else {
+                let t = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let new_id = format!("proj_{}", t);
+                let _ = fs::write(&id_file, &new_id);
+                new_id
+            };
+
+            let role = recovered_role.unwrap_or_else(|| "programmer".to_string());
+
+            // Re-create system config
+            let mut config_rows = Vec::new();
+            config_rows.push(MemoryRow {
+                vector: vec![0.0; EMBEDDING_DIMS as usize],
+                text: role.clone(),
+                tag: "system:role".to_string(),
+                memory_type: "system_config".to_string(),
+                file_path: "config".to_string(),
+                line_start: 0,
+                session_id: "global".to_string(),
+                name: String::new(),
+                references: "[]".to_string(),
+                depends_on: "[]".to_string(),
+                status: "active".to_string(),
+                mtime_secs: 0,
+                size_bytes: 0,
+                created_at: now,
+            });
+            config_rows.push(MemoryRow {
+                vector: vec![0.0; EMBEDDING_DIMS as usize],
+                text: project_id,
+                tag: "system:project_id".to_string(),
+                memory_type: "system_config".to_string(),
+                file_path: "config".to_string(),
+                line_start: 0,
+                session_id: "global".to_string(),
+                name: String::new(),
+                references: "[]".to_string(),
+                depends_on: "[]".to_string(),
+                status: "active".to_string(),
+                mtime_secs: 0,
+                size_bytes: 0,
+                created_at: now,
+            });
+            let _ = table.delete("memory_type = 'system_config'").await;
+            add_rows(&table, config_rows).await?;
+
+            if preserve_episodic && !recovered_rows.is_empty() {
+                println!("Re-importing {} episodic memories...", recovered_rows.len());
+                let mut embedder = init_embedder(cache_dir.clone(), true)?;
+
+                let mut docs = Vec::with_capacity(recovered_rows.len());
+                for r in &recovered_rows {
+                    let prefix = if r.memory_type == "trace" {
+                        "trace"
+                    } else if r.memory_type == "thought" {
+                        "thought"
+                    } else {
+                        "passage"
+                    };
+                    docs.push(format!("{}: {}", prefix, r.text));
+                }
+                let refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
+                let embeddings = embedder.embed(refs, None)?;
+
+                let mut rows_to_add = Vec::new();
+                for (r, vector) in recovered_rows.into_iter().zip(embeddings.into_iter()) {
+                    rows_to_add.push(MemoryRow {
+                        vector,
+                        text: r.text,
+                        tag: r.tag.unwrap_or_else(|| "imported".to_string()),
+                        memory_type: r.memory_type,
+                        file_path: r.file_path,
+                        line_start: r.line_start,
+                        session_id: r.session_id,
+                        name: r.name,
+                        references: r.references,
+                        depends_on: r.depends_on,
+                        status: r.status,
+                        mtime_secs: r.mtime_secs,
+                        size_bytes: r.size_bytes,
+                        created_at: r.created_at,
+                    });
+                }
+                add_rows(&table, rows_to_add).await?;
+            }
+
+            if !skip_learn {
+                do_learn(&project_root, &db_path, cache_dir.clone(), &root_dir, concurrency).await?;
+            } else {
+                println!("Skipped code re-index. Run `mem learn {}` when ready.", root_dir.display());
+            }
+
+            println!("Rebuild complete. Backup saved at {}", backup_path.display());
+        }
+        Command::Doctor => {
+            println!("Mandrid Doctor");
+            println!("- Project root: {}", project_root.display());
+            println!("- DB path: {}", db_path.display());
+
+            let version_path = db_path.join("FORMAT_VERSION");
+            if version_path.exists() {
+                let raw = fs::read_to_string(&version_path).unwrap_or_default();
+                let found = raw.trim().parse::<u32>().unwrap_or(0);
+                if found == DB_FORMAT_VERSION {
+                    println!("- DB format: {} (ok)", found);
+                } else {
+                    println!(
+                        "- DB format: {} (expected {}) -> run `mem rebuild`",
+                        found, DB_FORMAT_VERSION
+                    );
+                }
+            } else if db_path.exists() {
+                println!("- DB format: unknown (no FORMAT_VERSION marker)");
+            } else {
+                println!("- DB format: n/a (no DB yet; run `mem init`)");
+            }
+
+            // List backups
+            if let Some(parent) = db_path.parent() {
+                if let Ok(entries) = fs::read_dir(parent) {
+                    let mut backups = Vec::new();
+                    for e in entries.flatten() {
+                        let p = e.path();
+                        if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                            if name.starts_with(".mem_db.bak.") {
+                                backups.push(p);
+                            }
+                        }
+                    }
+                    backups.sort();
+                    if !backups.is_empty() {
+                        println!("- Backups:");
+                        for b in backups.iter().rev().take(3) {
+                            println!("  - {}", b.display());
+                        }
+                    }
+                }
+            }
+
+            // Attempt to open DB
+            match open_table(&db_path).await {
+                Ok(_) => println!("- DB open: ok"),
+                Err(e) => {
+                    println!("- DB open: failed ({})", e);
+                    println!("  Suggested fix: `mem rebuild` (or `mem init` if brand new)");
+                }
+            }
         }
         Command::Digest { file_path } => {
             let mut embedder = init_embedder(cache_dir.clone(), true)?;
@@ -814,80 +1603,203 @@ Your current assigned role: **{}**
             println!("Digested {}", file_path.display());
         }
         Command::Learn { root_dir, concurrency } => {
-            let table = open_or_create_table(&db_path).await?;
-            let stream = table.query().only_if("memory_type = 'code'").execute().await?;
-            let batches: Vec<RecordBatch> = stream.try_collect().await?;
-            let existing_rows = decode_rows(&batches, None)?;
-            
-            let mut db_file_map: HashMap<PathBuf, (u64, u64)> = HashMap::new();
-            for row in existing_rows {
-                db_file_map.insert(PathBuf::from(row.file_path), (row.mtime_secs, row.size_bytes));
-            }
-
-            let mut seen_on_disk = std::collections::HashSet::new();
-            let matcher = get_ignore_matcher(&project_root);
-            let mut files_to_process = Vec::new();
-            for result in WalkBuilder::new(&root_dir).hidden(false).git_ignore(true).build() {
-                if let Ok(entry) = result {
-                    let path = entry.path();
-                    if path.is_file() && is_supported_file(path) && !is_ignored(&matcher, path) {
-                        let rel_path = path.strip_prefix(&project_root).unwrap_or(path).to_path_buf();
-                        seen_on_disk.insert(rel_path.clone());
-                        
-                        let metadata = fs::metadata(path)?;
-                        let mtime = metadata.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
-                        let size = metadata.len();
-                        
-                        if let Some((db_mtime, db_size)) = db_file_map.get(&rel_path) {
-                            if *db_mtime == mtime && *db_size == size {
-                                continue;
-                            }
-                        }
-                        files_to_process.push((path.to_path_buf(), rel_path));
-                    }
-                }
-            }
-
-            // Prune files no longer on disk
-            for db_rel_path in db_file_map.keys() {
-                if !seen_on_disk.contains(db_rel_path) {
-                    let tag = format!("code:{}", db_rel_path.display());
-                    table.delete(format!("tag = '{}'", tag.replace('\'', "''")).as_str()).await?;
-                    println!("Pruned {}", db_rel_path.display());
-                }
-            }
-
-            println!("Indexing {} files...", files_to_process.len());
-            let mut processed = 0;
-            for chunk in files_to_process.chunks(concurrency) {
-                let mut tasks = Vec::new();
-                for (abs_file, rel_file) in chunk {
-                    let abs_file = abs_file.clone();
-                    let rel_file = rel_file.clone();
-                    let c_dir = cache_dir.clone();
-                    tasks.push(tokio::spawn(async move {
-                        let mut embedder = init_embedder(c_dir, false)?;
-                        digest_file_logic(&mut embedder, &abs_file, &rel_file).await
-                    }));
-                }
-                for task in tasks {
-                    if let Ok(Ok(rows)) = task.await {
-                        if !rows.is_empty() {
-                            let rel_path = &rows[0].file_path;
-                            let tag = format!("code:{}", rel_path);
-                            let _ = table.delete(format!("tag = '{}'", tag.replace('\'', "''")).as_str()).await;
-                            add_rows(&table, rows).await?;
-                            processed += 1;
-                        }
-                    }
-                }
-            }
-            if processed > 0 {
-                table.create_index(&["text"], Index::FTS(FtsIndexBuilder::default())).execute().await?;
-            }
-            println!("Finished: {} processed", processed);
+            do_learn(&project_root, &db_path, cache_dir.clone(), &root_dir, concurrency).await?;
         }
-        Command::Ask { question, json_output, limit, vector_only, task_aware, rerank } => {
+        Command::Pack {
+            input,
+            session,
+            scope,
+            token_budget,
+            k_episodic,
+            k_code,
+            include_code,
+            include_reasoning,
+            rerank,
+            vector_only,
+            json,
+        } => {
+            let table = open_table(&db_path).await.with_context(|| {
+                format!(
+                    "Database not found at {}. Run `mem init` first.",
+                    db_path.display()
+                )
+            })?;
+
+            let session_id = session.unwrap_or_else(|| "default".to_string());
+
+            // Role
+            let role = {
+                let stream = table
+                    .query()
+                    .only_if("tag = 'system:role'")
+                    .limit(1)
+                    .execute()
+                    .await?;
+                let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                let rows = decode_rows(&batches, None)?;
+                rows.first()
+                    .map(|r| r.text.clone())
+                    .unwrap_or_else(|| "programmer".to_string())
+            };
+
+            // Active task title
+            let active_task_title: Option<String> = {
+                let filter = match scope {
+                    ContextScope::Session => format!(
+                        "memory_type = 'task' AND status = 'active' AND (session_id = '{}' OR session_id = 'global')",
+                        escape_lancedb_str(&session_id)
+                    ),
+                    ContextScope::Project => "memory_type = 'task' AND status = 'active'".to_string(),
+                };
+                let stream = table.query().only_if(filter).limit(5).execute().await?;
+                let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                let mut rows = decode_rows(&batches, None)?;
+                rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                rows.first()
+                    .map(|t| t.text.lines().next().unwrap_or("").trim().to_string())
+                    .filter(|s| !s.is_empty())
+            };
+
+            // Last failure summary
+            let last_failure: Option<String> = {
+                let filter = match scope {
+                    ContextScope::Session => format!(
+                        "memory_type = 'trace' AND status = 'failure' AND session_id = '{}'",
+                        escape_lancedb_str(&session_id)
+                    ),
+                    ContextScope::Project => {
+                        "memory_type = 'trace' AND status = 'failure'".to_string()
+                    }
+                };
+                let stream = table.query().only_if(filter).limit(10).execute().await?;
+                let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                let mut rows = decode_rows(&batches, None)?;
+                rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                rows.first().map(|f| {
+                    let cmd = if f.name.is_empty() {
+                        f.tag.clone().unwrap_or_else(|| "unknown".to_string())
+                    } else {
+                        f.name.clone()
+                    };
+                    let first = f.text.lines().next().unwrap_or("").trim();
+                    if first.is_empty() {
+                        cmd
+                    } else {
+                        format!("{} :: {}", cmd, truncate_chars(first, 180))
+                    }
+                })
+            };
+
+            let mut embedder = init_embedder(cache_dir.clone(), false)?;
+            let query_embedding = embed_prefixed(&mut embedder, "query", &input)?;
+
+            let episodic_filter = match scope {
+                ContextScope::Session => format!(
+                    "memory_type != 'code' AND memory_type != 'system_config' AND session_id = '{}'{}",
+                    escape_lancedb_str(&session_id),
+                    if include_reasoning { "" } else { " AND memory_type != 'reasoning'" }
+                ),
+                ContextScope::Project => {
+                    format!(
+                        "memory_type != 'code' AND memory_type != 'system_config'{}",
+                        if include_reasoning { "" } else { " AND memory_type != 'reasoning'" }
+                    )
+                }
+            };
+
+            let mut reranker = if rerank {
+                Some(init_reranker(cache_dir.clone(), false)?)
+            } else {
+                None
+            };
+
+            let episodic_rows: Vec<DecodedRow> = if k_episodic == 0 {
+                Vec::new()
+            } else if let Some(ref mut rr) = reranker {
+                ask_hybrid_with_reranker(
+                    &table,
+                    &query_embedding,
+                    &input,
+                    k_episodic,
+                    vector_only,
+                    Some(&episodic_filter),
+                    rr,
+                )
+                .await?
+            } else {
+                ask_rrf_filtered(
+                    &table,
+                    &query_embedding,
+                    &input,
+                    k_episodic,
+                    vector_only,
+                    &episodic_filter,
+                )
+                .await?
+            };
+
+            let code_rows: Vec<DecodedRow> = if include_code && k_code > 0 {
+                let code_filter = "memory_type = 'code'";
+                if let Some(ref mut rr) = reranker {
+                    ask_hybrid_with_reranker(
+                        &table,
+                        &query_embedding,
+                        &input,
+                        k_code,
+                        vector_only,
+                        Some(code_filter),
+                        rr,
+                    )
+                    .await?
+                } else {
+                    ask_rrf_filtered(
+                        &table,
+                        &query_embedding,
+                        &input,
+                        k_code,
+                        vector_only,
+                        code_filter,
+                    )
+                    .await?
+                }
+            } else {
+                Vec::new()
+            };
+
+            let pack = build_pack_text(
+                &role,
+                &session_id,
+                &scope,
+                token_budget,
+                &input,
+                active_task_title.as_deref(),
+                last_failure.as_deref(),
+                &episodic_rows,
+                &code_rows,
+            );
+
+            if json {
+                let payload = PackJsonPayload {
+                    role: role.clone(),
+                    session_id: session_id.clone(),
+                    scope: scope_to_str(&scope).to_string(),
+                    token_budget,
+                    input: input.clone(),
+                    active_task_title: active_task_title.clone(),
+                    last_failure: last_failure.clone(),
+                    episodic: episodic_rows
+                        .iter()
+                        .map(|r| to_pack_item(r, 700, false))
+                        .collect(),
+                    code: code_rows.iter().map(|r| to_pack_item(r, 900, true)).collect(),
+                    pack,
+                };
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                print!("{}", pack);
+            }
+        }
+        Command::Ask { question, json_output, limit, vector_only, scope, task_aware, rerank } => {
             if is_server_alive(3000).await && !task_aware {
                 let client = reqwest::Client::new();
                 let resp = client.get("http://localhost:3000/api/search")
@@ -937,8 +1849,25 @@ Your current assigned role: **{}**
 
             let query_embedding = embed_prefixed(&mut embedder, "query", &final_query)?;
             
+            let scope_filter = match scope {
+                AskScope::All => None,
+                AskScope::Code => Some("memory_type = 'code' AND memory_type != 'system_config'".to_string()),
+                AskScope::Episodic => Some("memory_type != 'code' AND memory_type != 'system_config'".to_string()),
+            };
+
             let results = if rerank {
-                ask_hybrid(&table, &query_embedding, &final_query, limit, cache_dir.clone()).await?
+                ask_hybrid(
+                    &table,
+                    &query_embedding,
+                    &final_query,
+                    limit,
+                    vector_only,
+                    cache_dir.clone(),
+                    scope_filter.as_deref(),
+                )
+                .await?
+            } else if let Some(f) = scope_filter.as_deref() {
+                ask_rrf_filtered(&table, &query_embedding, &final_query, limit, vector_only, f).await?
             } else {
                 ask_rrf(&table, &query_embedding, &final_query, limit, vector_only).await?
             };
@@ -1168,7 +2097,7 @@ Your current assigned role: **{}**
                 let row = MemoryRow {
                     vector: embedding,
                     text: full_text,
-                    tag: "git:history".to_string(),
+                    tag: get_origin_tag("git:history"),
                     memory_type: "git_reasoning".to_string(),
                     file_path: "git".to_string(),
                     line_start: 0,
@@ -1185,10 +2114,29 @@ Your current assigned role: **{}**
             }
             println!("Synced {} commits.", commits);
         }
-        Command::Serve { port } => {
+        Command::Stop => {
+            if is_server_alive(3000).await {
+                let client = reqwest::Client::new();
+                let _ = client.post("http://localhost:3000/api/stop").send().await;
+                println!("🛑 Mandrid daemon stopped.");
+            } else {
+                println!("Mandrid daemon is not running.");
+            }
+        }
+        Command::Serve { port, background } => {
+            if background {
+                let args: Vec<String> = std::env::args().filter(|a| a != "--background").collect();
+                let _ = std::process::Command::new(&args[0])
+                    .args(&args[1..])
+                    .spawn()
+                    .expect("Failed to spawn background daemon");
+                println!("🚀 Mandrid daemon started in background on port {}", port);
+                return Ok(());
+            }
+
             let embedder = init_embedder(cache_dir.clone(), true)?;
             let state = ServeState {
-                db_path: db_path.clone(),
+                active_db_path: Arc::new(Mutex::new(db_path.clone())),
                 cache_dir: cache_dir.clone(),
                 embedder: Arc::new(Mutex::new(embedder)),
                 reranker: Arc::new(Mutex::new(None)),
@@ -1196,18 +2144,48 @@ Your current assigned role: **{}**
 
             let app = Router::new()
                 .route("/", get(|| async { Html(include_str!("dashboard.html")) }))
-                .route("/api/status", get(move |State(state): State<ServeState>| async move {
+                .route("/api/status", get(move |State(st): State<ServeState>| async move {
+                    let db_p = st.active_db_path.lock().await;
                     Json(StatusResponse {
                         status: "ok".to_string(),
                         version: env!("CARGO_PKG_VERSION").to_string(),
-                        db_path: state.db_path.display().to_string(),
+                        db_path: db_p.display().to_string(),
                     })
                 }))
                 .route(
+                    "/api/projects",
+                    get(|State(_state): State<ServeState>| async move {
+                        let projects = get_registered_projects();
+                        let mut results = Vec::new();
+                        for p in projects {
+                            let db_p = p.join(DEFAULT_DB_DIR);
+                            let status = if db_p.exists() { "initialized" } else { "missing" };
+                            results.push(serde_json::json!({
+                                "name": p.file_name().unwrap_or_default().to_string_lossy(),
+                                "path": p.to_string_lossy(),
+                                "status": status
+                            }));
+                        }
+                        Json(results)
+                    }),
+                )
+                .route("/api/switch", post(|State(state): State<ServeState>, Query(q): Query<HashMap<String, String>>| async move {
+                    if let Some(path_str) = q.get("path") {
+                        let path = PathBuf::from(path_str);
+                        if path.exists() {
+                            let mut db_p = state.active_db_path.lock().await;
+                            *db_p = path.join(DEFAULT_DB_DIR);
+                            return Json(serde_json::json!({"status": "switched", "active": path_str}));
+                        }
+                    }
+                    Json(serde_json::json!({"status": "error", "message": "invalid path"}))
+                }))
+                .route(
                     "/api/log",
-                    post(|State(state): State<ServeState>, Json(req): Json<LogRequest>| async move {
-                        let mut embedder = state.embedder.lock().await;
-                        let table = match open_or_create_table(&state.db_path).await {
+                    post(|State(st): State<ServeState>, Json(req): Json<LogRequest>| async move {
+                        let mut embedder = st.embedder.lock().await;
+                        let db_p = st.active_db_path.lock().await;
+                        let table = match open_or_create_table(&db_p).await {
                             Ok(t) => t,
                             Err(_) => return Json(serde_json::json!({"error": "db_error"})),
                         };
@@ -1241,9 +2219,107 @@ Your current assigned role: **{}**
                     }),
                 )
                 .route(
+                    "/api/senses",
+                    get(|State(st): State<ServeState>| async move {
+                        let db_p = st.active_db_path.lock().await;
+                        let table = match open_table(&db_p).await {
+                            Ok(t) => t,
+                            Err(_) => return Json(serde_json::json!({"dead_code": [], "bottlenecks": []})),
+                        };
+
+                        let stream = match table.query().only_if("memory_type = 'code'").execute().await {
+                            Ok(s) => s,
+                            Err(_) => return Json(serde_json::json!({"dead_code": [], "bottlenecks": []})),
+                        };
+                        let batches: Vec<RecordBatch> = match stream.try_collect().await {
+                            Ok(b) => b,
+                            Err(_) => return Json(serde_json::json!({"dead_code": [], "bottlenecks": []})),
+                        };
+                        let all_symbols = decode_rows(&batches, None).unwrap_or_default();
+
+                        let mut dead_code = Vec::new();
+                        let mut bottlenecks = Vec::new();
+
+                        for symbol_row in &all_symbols {
+                            if symbol_row.name.is_empty() || symbol_row.name == "anonymous" { continue; }
+                            
+                            // Check references
+                            let impacted = find_impacted(&table, &symbol_row.name).await.unwrap_or_default();
+                            
+                            if impacted.is_empty() {
+                                dead_code.push(serde_json::json!({
+                                    "name": symbol_row.name,
+                                    "file": symbol_row.file_path
+                                }));
+                            } else if impacted.len() > 5 {
+                                bottlenecks.push(serde_json::json!({
+                                    "name": symbol_row.name,
+                                    "count": impacted.len()
+                                }));
+                            }
+                        }
+
+                        bottlenecks.sort_by_key(|b| std::cmp::Reverse(b["count"].as_u64().unwrap_or(0)));
+
+                        Json(serde_json::json!({
+                            "dead_code": dead_code.into_iter().take(10).collect::<Vec<_>>(),
+                            "bottlenecks": bottlenecks.into_iter().take(10).collect::<Vec<_>>()
+                        }))
+                    }),
+                )
+                .route(
+                    "/api/graph",
+                    get(|State(st): State<ServeState>| async move {
+                        let db_p = st.active_db_path.lock().await;
+                        let table = match open_table(&db_p).await {
+                            Ok(t) => t,
+                            Err(_) => return Json(serde_json::json!({"nodes": [], "edges": []})),
+                        };
+
+                        let stream = match table.query().only_if("memory_type = 'code'").execute().await {
+                            Ok(s) => s,
+                            Err(_) => return Json(serde_json::json!({"nodes": [], "edges": []})),
+                        };
+                        let batches: Vec<RecordBatch> = match stream.try_collect().await {
+                            Ok(b) => b,
+                            Err(_) => return Json(serde_json::json!({"nodes": [], "edges": []})),
+                        };
+                        let rows = decode_rows(&batches, None).unwrap_or_default();
+
+                        let mut nodes = Vec::new();
+                        let mut edges = Vec::new();
+                        let mut seen_symbols = std::collections::HashSet::new();
+
+                        for row in &rows {
+                            if row.name.is_empty() { continue; }
+                            if !seen_symbols.contains(&row.name) {
+                                nodes.push(serde_json::json!({
+                                    "id": row.name,
+                                    "label": row.name,
+                                    "type": "symbol",
+                                    "file": row.file_path
+                                }));
+                                seen_symbols.insert(row.name.clone());
+                            }
+
+                            if let Ok(refs) = serde_json::from_str::<Vec<String>>(&row.references) {
+                                for r in refs {
+                                    edges.push(serde_json::json!({
+                                        "source": row.name,
+                                        "target": r
+                                    }));
+                                }
+                            }
+                        }
+
+                        Json(serde_json::json!({ "nodes": nodes, "edges": edges }))
+                    }),
+                )
+                .route(
                     "/api/memories",
-                    get(|State(state): State<ServeState>, Query(q): Query<MemoriesQuery>| async move {
-                        let table = match open_table(&state.db_path).await {
+                    get(|State(st): State<ServeState>, Query(q): Query<MemoriesQuery>| async move {
+                        let db_p = st.active_db_path.lock().await;
+                        let table = match open_table(&db_p).await {
                             Ok(t) => t,
                             Err(_) => return Json(Vec::<DecodedRow>::new()),
                         };
@@ -1264,8 +2340,9 @@ Your current assigned role: **{}**
                 )
                 .route(
                     "/api/search",
-                    get(|State(state): State<ServeState>, Query(q): Query<SearchQuery>| async move {
-                        let table = match open_table(&state.db_path).await {
+                    get(|State(st): State<ServeState>, Query(q): Query<SearchQuery>| async move {
+                        let db_p = st.active_db_path.lock().await;
+                        let table = match open_table(&db_p).await {
                             Ok(t) => t,
                             Err(_) => return Json(Vec::<DecodedRow>::new()),
                         };
@@ -1280,7 +2357,7 @@ Your current assigned role: **{}**
                         }
 
                         let query_vec = {
-                            let mut embedder = state.embedder.lock().await;
+                            let mut embedder = st.embedder.lock().await;
                             match embed_prefixed(&mut embedder, "query", &query_text) {
                                 Ok(v) => v,
                                 Err(_) => return Json(Vec::<DecodedRow>::new()),
@@ -1288,15 +2365,15 @@ Your current assigned role: **{}**
                         };
 
                         let rows = if rerank {
-                            let mut reranker_guard = state.reranker.lock().await;
+                            let mut reranker_guard = st.reranker.lock().await;
                             if reranker_guard.is_none() {
-                                match init_reranker(state.cache_dir.clone(), false) {
+                                match init_reranker(st.cache_dir.clone(), false) {
                                     Ok(r) => *reranker_guard = Some(r),
                                     Err(_) => return Json(Vec::<DecodedRow>::new()),
                                 }
                             }
                             match reranker_guard.as_mut() {
-                                Some(r) => ask_hybrid_with_reranker(&table, &query_vec, &query_text, limit, r)
+                            Some(r) => ask_hybrid_with_reranker(&table, &query_vec, &query_text, limit, false, None, r)
                                     .await
                                     .unwrap_or_default(),
                                 None => Vec::new(),
@@ -1307,18 +2384,20 @@ Your current assigned role: **{}**
                                 .unwrap_or_default()
                         };
 
+
                         Json(rows)
                     }),
                 )
                 .route(
                     "/api/check-risk",
-                    get(|State(state): State<ServeState>, Query(q): Query<SearchQuery>| async move {
-                        let table = match open_table(&state.db_path).await {
+                    get(|State(st): State<ServeState>, Query(q): Query<SearchQuery>| async move {
+                        let db_p = st.active_db_path.lock().await;
+                        let table = match open_table(&db_p).await {
                             Ok(t) => t,
                             Err(_) => return Json(serde_json::json!({"risk": null})),
                         };
 
-                        let mut embedder = state.embedder.lock().await;
+                        let mut embedder = st.embedder.lock().await;
                         let query_vec = match embed_prefixed(&mut embedder, "query", &q.q) {
                             Ok(v) => v,
                             Err(_) => return Json(serde_json::json!({"risk": null})),
@@ -1326,6 +2405,14 @@ Your current assigned role: **{}**
 
                         let risk = check_risk(&table, &query_vec).await.unwrap_or(None);
                         Json(serde_json::json!({"risk": risk}))
+                    }),
+                )
+                .route(
+                    "/api/stop",
+                    post(|| async {
+                        std::process::exit(0);
+                        #[allow(unreachable_code)]
+                        Json(serde_json::json!({"status": "stopping"}))
                     }),
                 )
                 .layer(CorsLayer::permissive())
@@ -1668,6 +2755,56 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
             }
             io_threads.join()?;
         }
+        Command::Tools { format } => {
+            if format == "markdown" {
+                println!(r#"# Mandrid AI Toolset
+You are equipped with Mandrid, a local persistent memory layer. Use these tools via the `mem` CLI:
+
+ ## Retrieval
+ - `mem pack "<user message>"`: **ALWAYS-ON (runner)**. Tiny, token-budgeted context pack designed to inject every prompt.
+ - `mem context [--human --compact --scope session] [--file <path>]`: **REQUIRED START**. Bootstrap your session with low-noise context (role, active tasks, recent failures).
+ - `mem ask "<query>" [--rerank] [--scope code|episodic]`: Semantic/Hybrid search.
+ - `mem impact <symbol>`: Deterministic blast-radius analysis. See who calls this function/struct.
+ - `mem why <symbol>`: Attribution. See the reasoning traces captured when this symbol was last modified.
+
+## Capture
+- `mem think "<reasoning>"`: **PROACTIVE**. Store your plan before acting.
+- `mem run -- <command>`: **CRITICAL**. Run terminal commands through this to record success/failure and output.
+- `mem capture "<summary>"`: Permanent record of changes and reasoning.
+
+ ## Maintenance
+ - `mem rebuild`: Rebuild the local DB after significant Mandrid updates (backs up `.mem_db`, regenerates it).
+ - `mem doctor`: Diagnose DB health/version and show backups.
+
+## Data Model (practical)
+- `memory_type=code`: indexed code chunks (AST-based)
+- `memory_type=trace`: terminal command logs (success/failure)
+- `memory_type=thought`: active plans/decisions
+- `memory_type=task`: active goals
+- `memory_type=reasoning`: captured diffs + rationale
+- `memory_type=manual` / `interaction`: ad-hoc notes and agent logs
+
+## Senses
+- `mem sense dead-code`: Find unreferenced symbols.
+- `mem sense bottlenecks`: Find over-referenced "God objects".
+"#);
+            } else {
+                // Simplified JSON schema for agent capability negotiation
+                let schema = serde_json::json!({
+                     "tools": [
+                        { "name": "mem pack", "description": "Build a tiny token-budgeted context pack for every prompt." },
+                         { "name": "mem context", "description": "Retrieve project state, tasks, and recent failures." },
+                         { "name": "mem ask", "description": "Search code and reasoning history." },
+                         { "name": "mem impact", "description": "Graph-based dependency analysis." },
+                         { "name": "mem think", "description": "Persist internal reasoning." },
+                         { "name": "mem run", "description": "Execute terminal commands with telemetry capture." },
+                        { "name": "mem rebuild", "description": "Rebuild the local DB after a Mandrid update." },
+                        { "name": "mem doctor", "description": "Diagnose DB health/version and show backups." }
+                     ]
+                 });
+                println!("{}", serde_json::to_string_pretty(&schema)?);
+            }
+        }
         Command::Run { command, session, note } => {
             if command.is_empty() {
                 anyhow::bail!("No command provided to run.");
@@ -1738,6 +2875,102 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
             println!("\n✅ Interaction recorded to Mandrid.");
         }
     }
+    Ok(())
+}
+
+async fn do_learn(
+    project_root: &Path,
+    db_path: &Path,
+    cache_dir: Option<PathBuf>,
+    root_dir: &Path,
+    concurrency: usize,
+) -> Result<()> {
+    let table = open_or_create_table(db_path).await?;
+    let stream = table.query().only_if("memory_type = 'code'").execute().await?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+    let existing_rows = decode_rows(&batches, None)?;
+
+    let mut db_file_map: HashMap<PathBuf, (u64, u64)> = HashMap::new();
+    for row in existing_rows {
+        db_file_map.insert(PathBuf::from(row.file_path), (row.mtime_secs, row.size_bytes));
+    }
+
+    let mut seen_on_disk = std::collections::HashSet::new();
+    let matcher = get_ignore_matcher(project_root);
+    let mut files_to_process = Vec::new();
+    for result in WalkBuilder::new(root_dir)
+        .hidden(false)
+        .git_ignore(true)
+        .build()
+    {
+        if let Ok(entry) = result {
+            let path = entry.path();
+            if path.is_file() && is_supported_file(path) && !is_ignored(&matcher, path) {
+                let rel_path = path.strip_prefix(project_root).unwrap_or(path).to_path_buf();
+                seen_on_disk.insert(rel_path.clone());
+
+                let metadata = fs::metadata(path)?;
+                let mtime = metadata
+                    .modified()?
+                    .duration_since(SystemTime::UNIX_EPOCH)?
+                    .as_secs();
+                let size = metadata.len();
+
+                if let Some((db_mtime, db_size)) = db_file_map.get(&rel_path) {
+                    if *db_mtime == mtime && *db_size == size {
+                        continue;
+                    }
+                }
+                files_to_process.push((path.to_path_buf(), rel_path));
+            }
+        }
+    }
+
+    // Prune files no longer on disk
+    for db_rel_path in db_file_map.keys() {
+        if !seen_on_disk.contains(db_rel_path) {
+            let tag = format!("code:{}", db_rel_path.display());
+            table
+                .delete(format!("tag = '{}'", tag.replace('\'', "''")).as_str())
+                .await?;
+            println!("Pruned {}", db_rel_path.display());
+        }
+    }
+
+    println!("Indexing {} files...", files_to_process.len());
+    let mut processed = 0;
+    for chunk in files_to_process.chunks(concurrency) {
+        let mut tasks = Vec::new();
+        for (abs_file, rel_file) in chunk {
+            let abs_file = abs_file.clone();
+            let rel_file = rel_file.clone();
+            let c_dir = cache_dir.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut embedder = init_embedder(c_dir, false)?;
+                digest_file_logic(&mut embedder, &abs_file, &rel_file).await
+            }));
+        }
+        for task in tasks {
+            if let Ok(Ok(rows)) = task.await {
+                if !rows.is_empty() {
+                    let rel_path = &rows[0].file_path;
+                    let tag = format!("code:{}", rel_path);
+                    let _ = table
+                        .delete(format!("tag = '{}'", tag.replace('\'', "''")).as_str())
+                        .await;
+                    add_rows(&table, rows).await?;
+                    processed += 1;
+                }
+            }
+        }
+    }
+    if processed > 0 {
+        table
+            .create_index(&["text"], Index::FTS(FtsIndexBuilder::default()))
+            .execute()
+            .await?;
+    }
+    println!("Finished: {} processed", processed);
     Ok(())
 }
 

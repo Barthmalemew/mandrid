@@ -31,7 +31,7 @@ use axum::{
     extract::Query,
     extract::State,
     response::Html,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use tower_http::cors::CorsLayer;
@@ -255,6 +255,12 @@ enum Command {
         shell: String,
     },
 
+    /// Propose a fix for the most recent failure in memory.
+    Fix {
+        #[arg(long)]
+        session: Option<String>,
+    },
+
     /// Start a minimal LSP server to receive real-time code changes.
     Lsp,
 
@@ -300,12 +306,22 @@ struct MemoriesQuery {
     limit: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
-struct SearchQuery {
-    q: String,
-    limit: Option<usize>,
-    rerank: Option<bool>,
-    vector_only: Option<bool>,
+#[derive(Debug, Deserialize, serde::Serialize)]
+struct LogRequest {
+    text: String,
+    tag: String,
+    memory_type: String,
+    status: String,
+    file_path: Option<String>,
+    name: Option<String>,
+    session: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct StatusResponse {
+    status: String,
+    version: String,
+    db_path: String,
 }
 
 fn get_ignore_matcher(root: &Path) -> ignore::gitignore::Gitignore {
@@ -321,6 +337,25 @@ fn get_ignore_matcher(root: &Path) -> ignore::gitignore::Gitignore {
 
 fn is_ignored(matcher: &ignore::gitignore::Gitignore, path: &Path) -> bool {
     matcher.matched(path, false).is_ignore()
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+struct SearchQuery {
+    q: String,
+    limit: Option<usize>,
+    rerank: Option<bool>,
+    vector_only: Option<bool>,
+}
+
+async fn is_server_alive(port: u16) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(100))
+        .build()
+        .unwrap();
+    client.get(format!("http://localhost:{}/api/status", port))
+        .send()
+        .await
+        .is_ok()
 }
 
 #[tokio::main]
@@ -358,6 +393,19 @@ async fn main() -> Result<()> {
             println!("Saved");
         }
         Command::Log { text, tag, memory_type, status, file_path, name, session } => {
+            if is_server_alive(3000).await {
+                let client = reqwest::Client::new();
+                let req = LogRequest {
+                    text, tag, memory_type, status, file_path, name, session
+                };
+                let _ = client.post("http://localhost:3000/api/log")
+                    .json(&req)
+                    .send()
+                    .await;
+                println!("Logged (via daemon)");
+                return Ok(());
+            }
+
             let mut embedder = init_embedder(cache_dir.clone(), true)?;
             let table = open_or_create_table(&db_path).await?;
 
@@ -819,6 +867,40 @@ Your current assigned role: **{}**
             println!("Finished: {} processed", processed);
         }
         Command::Ask { question, json_output, limit, vector_only, task_aware, rerank } => {
+            if is_server_alive(3000).await && !task_aware {
+                let client = reqwest::Client::new();
+                let resp = client.get("http://localhost:3000/api/search")
+                    .query(&[("q", &question), ("limit", &limit.to_string())])
+                    .query(&[("rerank", &rerank.to_string()), ("vector_only", &vector_only.to_string())])
+                    .send()
+                    .await?;
+                
+                if resp.status().is_success() {
+                    let results: Vec<DecodedRow> = resp.json().await?;
+                    if json_output {
+                        let payload = AskJsonPayload {
+                            question,
+                            results: results.into_iter().enumerate().map(|(i, r)| AskJsonResult {
+                                rank: i + 1,
+                                tag: r.tag,
+                                text: r.text,
+                                memory_type: r.memory_type,
+                                file_path: Some(r.file_path),
+                                line_start: Some(r.line_start),
+                                created_at: r.created_at,
+                            }).collect(),
+                        };
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                    } else {
+                        for (i, r) in results.into_iter().enumerate() {
+                            println!("\n{}. [{}] ({}:{})", i + 1, r.tag.unwrap_or_default(), r.file_path, r.line_start);
+                            println!("{}", r.text);
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+
             let mut embedder = init_embedder(cache_dir.clone(), !json_output)?;
             let table = open_table(&db_path).await?;
 
@@ -1093,6 +1175,50 @@ Your current assigned role: **{}**
 
             let app = Router::new()
                 .route("/", get(|| async { Html(include_str!("dashboard.html")) }))
+                .route("/api/status", get(move |State(state): State<ServeState>| async move {
+                    Json(StatusResponse {
+                        status: "ok".to_string(),
+                        version: env!("CARGO_PKG_VERSION").to_string(),
+                        db_path: state.db_path.display().to_string(),
+                    })
+                }))
+                .route(
+                    "/api/log",
+                    post(|State(state): State<ServeState>, Json(req): Json<LogRequest>| async move {
+                        let mut embedder = state.embedder.lock().await;
+                        let table = match open_or_create_table(&state.db_path).await {
+                            Ok(t) => t,
+                            Err(_) => return Json(serde_json::json!({"error": "db_error"})),
+                        };
+
+                        let prefix = if req.memory_type == "trace" { "trace" } else { "passage" };
+                        let embedding = match embed_prefixed(&mut embedder, prefix, &req.text) {
+                            Ok(v) => v,
+                            Err(_) => return Json(serde_json::json!({"error": "embed_error"})),
+                        };
+                        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+
+                        let default_path = if req.memory_type == "trace" { "terminal" } else { "interaction" };
+                        let row = MemoryRow {
+                            vector: embedding,
+                            text: req.text,
+                            tag: req.tag,
+                            memory_type: req.memory_type,
+                            file_path: req.file_path.unwrap_or_else(|| default_path.to_string()),
+                            line_start: 0,
+                            session_id: req.session.unwrap_or_else(|| "default".to_string()),
+                            name: req.name.unwrap_or_default(),
+                            references: "[]".to_string(),
+                            depends_on: "[]".to_string(),
+                            status: req.status,
+                            mtime_secs: 0,
+                            size_bytes: 0,
+                            created_at: now,
+                        };
+                        let _ = add_rows(&table, vec![row]).await;
+                        Json(serde_json::json!({"status": "logged"}))
+                    }),
+                )
                 .route(
                     "/api/memories",
                     get(|State(state): State<ServeState>, Query(q): Query<MemoriesQuery>| async move {
@@ -1287,6 +1413,46 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
                 }
             }
         }
+        Command::Fix { session } => {
+            let table = open_table(&db_path).await?;
+            let session_id = session.unwrap_or_else(|| "default".to_string());
+            
+            // 1. Get the last failure
+            let filter = format!("memory_type = 'trace' AND status = 'failure' AND session_id = '{}'", session_id.replace('\'', "''"));
+            let stream = table.query().only_if(filter).limit(1).execute().await?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+            let failures = decode_rows(&batches, None)?;
+            
+            let last_failure = match failures.first() {
+                Some(f) => f,
+                None => {
+                    println!("No recent failures found in session '{}'.", session_id);
+                    return Ok(());
+                }
+            };
+
+            println!("🔧 Analyzing last failure: {}", last_failure.name);
+            println!("Error Sample: {}\n", last_failure.text.lines().take(5).collect::<Vec<_>>().join("\n"));
+
+            // 2. Semantic search for relevant code context
+            let mut embedder = init_embedder(cache_dir.clone(), false)?;
+            // Use the error text as the query
+            let query_vec = embed_prefixed(&mut embedder, "query", &last_failure.text)?;
+            let context_rows = ask_rrf(&table, &query_vec, &last_failure.text, 3, false).await?;
+
+            println!("--- SUGGESTED CONTEXT FOR REPAIR ---");
+            for (i, row) in context_rows.iter().enumerate() {
+                println!("{}. {}:{} ({})", i+1, row.file_path, row.line_start, row.memory_type);
+            }
+
+            println!("\n--- PROMPT FOR YOUR AGENT ---");
+            println!("The following command failed:\n```\n{}\n```", last_failure.text);
+            println!("\nRelevant code context detected by Mandrid:");
+            for row in context_rows {
+                println!("\nFile: {}\n```\n{}\n```", row.file_path, row.text);
+            }
+            println!("\nPlease analyze the error and propose a fix.");
+        }
         Command::Lsp => {
             let (connection, io_threads) = Connection::stdio();
             let server_capabilities = serde_json::to_value(&ServerCapabilities {
@@ -1388,7 +1554,6 @@ PROMPT_COMMAND="mandrid_log_cmd; $PROMPT_COMMAND"
     Ok(())
 }
 
-// Logic wrappers to bridge modules
 async fn digest_file_logic(embedder: &mut TextEmbedding, abs_path: &Path, rel_path: &Path) -> Result<Vec<MemoryRow>> {
     let content = tokio::fs::read_to_string(abs_path).await?;
     digest_file_content_logic(embedder, &content, abs_path, rel_path).await

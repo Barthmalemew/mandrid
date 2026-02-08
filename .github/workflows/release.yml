@@ -34,7 +34,7 @@ jobs:
     name: Publish for ${{ matrix.os }}
     needs: release
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       matrix:
         include:

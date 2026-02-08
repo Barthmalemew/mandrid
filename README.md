@@ -56,6 +56,18 @@ Mandrid utilizes `fastembed` for local inference.
    mem context --human --compact --scope session
    ```
 
+**Pack controls (optional):**
+```bash
+# Keep only recent episodic memories
+mem pack "<prompt>" --max-age-days 7
+
+# Include or exclude memory types
+mem pack "<prompt>" --include-types task,thought --exclude-types trace
+
+# Cap noisy types so they can't crowd out the pack
+mem pack "<prompt>" --type-caps trace=2,thought=1,task=2,auto=2
+```
+
 4. **Enable automated capture (Shell Hook):**
     Add the following to your shell configuration (`.zshrc`, `.bashrc`, or PowerShell `$PROFILE`):
    ```bash

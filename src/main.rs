@@ -415,7 +415,7 @@ async fn main() -> Result<()> {
             let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
             let threshold = now - (days * 86400);
 
-            let mut filter = format!("created_at < {} AND memory_type IN ('trace', 'git_reasoning')", threshold);
+            let mut filter = format!("created_at < {} AND memory_type IN ('trace', 'git_reasoning', 'thought')", threshold);
             if let Some(s) = session {
                 filter.push_str(&format!(" AND session_id = '{}'", s.replace('\'', "''")));
             }
@@ -440,13 +440,22 @@ async fn main() -> Result<()> {
                 let total = group.len();
                 let failures = group.iter().filter(|r| r.status == "failure").count();
                 let last_success = group.iter().rev().find(|r| r.status == "success");
+                
+                // Extract unique goals/tasks mentioned in this session
+                let mut goals = group.iter()
+                    .filter(|r| r.memory_type == "thought")
+                    .map(|r| r.text.lines().next().unwrap_or("").to_string())
+                    .collect::<Vec<_>>();
+                goals.sort();
+                goals.dedup();
 
                 let summary_text = format!(
-                    "SESSION SUMMARY [{}]: Compressed {} traces. Encountered {} failures. Final achievement: {}",
+                    "SESSION SUMMARY [{}]: Compressed {} items. Encountered {} failures. Goals addressed: {}. Final result: {}",
                     session_id,
                     total,
                     failures,
-                    last_success.map(|r| r.text.lines().next().unwrap_or("n/a")).unwrap_or("None")
+                    if goals.is_empty() { "n/a".to_string() } else { goals.join(", ") },
+                    last_success.map(|r| r.text.lines().next().unwrap_or("n/a")).unwrap_or("Incomplete")
                 );
 
                 // Create the summary
@@ -625,11 +634,28 @@ async fn main() -> Result<()> {
                 println!("\n## Active Session: {}", session_id);
                 for row in rows {
                     if (row.memory_type == "task" || row.memory_type == "thought") && row.status == "active" { continue; }
-                    println!("\n## {} ({})", row.tag.unwrap_or_else(|| "unknown".to_string()), row.memory_type);
+                    
+                    let header = format!("## {} ({})", row.tag.unwrap_or_else(|| "unknown".to_string()), row.memory_type);
                     if row.memory_type == "code" {
-                        println!("File: {}:{}", row.file_path, row.line_start);
+                        println!("{} {}:{}", header, row.file_path, row.line_start);
+                    } else {
+                        println!("{}", header);
                     }
-                    println!("{}", row.text);
+
+                    // For extremely long reasoning or traces, truncate the middle to preserve tokens
+                    // while keeping the "intent" and "result".
+                    if row.text.len() > 2000 && (row.memory_type == "trace" || row.memory_type == "reasoning") {
+                        let lines: Vec<&str> = row.text.lines().collect();
+                        if lines.len() > 40 {
+                            for line in &lines[..20] { println!("{}", line); }
+                            println!("... [{} lines truncated for token efficiency] ...", lines.len() - 40);
+                            for line in &lines[lines.len()-20..] { println!("{}", line); }
+                        } else {
+                            println!("{}", row.text);
+                        }
+                    } else {
+                        println!("{}", row.text);
+                    }
                 }
                 println!("</project_context>");
             }

@@ -76,7 +76,7 @@
         # Fast-path: Download pre-built binary from GitHub
         mandrid-bin = pkgs.stdenv.mkDerivation rec {
           pname = "mandrid-bin";
-          version = "0.1.5";
+          version = "0.1.6";
 
           src = pkgs.fetchurl {
             url = "https://github.com/Barthmalemew/mandrid/releases/download/v${version}/mandrid-linux-amd64";

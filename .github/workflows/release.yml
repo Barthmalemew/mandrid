@@ -70,6 +70,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup MSVC (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -86,13 +90,15 @@ jobs:
           CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
         run: |
           if [ -z "$CACHIX_AUTH_TOKEN" ]; then
-            echo "Error: CACHIX_AUTH_TOKEN is not set. Check your GitHub Secrets."
-            exit 1
+            echo "Warning: CACHIX_AUTH_TOKEN is not set. Skipping Cachix push."
+            SKIP_CACHIX_PUSH=1
           fi
           nix build .#mandrid
           # Get the closure of the build result and push it all explicitly
-          echo "Pushing store paths to Cachix..."
-          nix path-info --recursive .#mandrid | cachix push mandrid
+          if [ -z "${SKIP_CACHIX_PUSH:-}" ]; then
+            echo "Pushing store paths to Cachix..."
+            nix path-info --recursive .#mandrid | cachix push mandrid
+          fi
 
       - name: Build with Cargo (all platforms)
         run: cargo build --locked --release

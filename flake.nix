@@ -16,7 +16,7 @@
 
   nixConfig = {
     extra-substituters = [ "https://mandrid.cachix.org" ];
-    extra-trusted-public-keys = [ "mandrid.cachix.org-1:nS+Jj4Qe8OInF/eYhB+W59Y/W8O+v4M0W1L+9+e7Q8A=" ];
+    extra-trusted-public-keys = [ "mandrid.cachix.org-1:G0qaL68v4rfvk5S5CqroPoS63TmXOOyZIoPPNH1b1MY=" ];
   };
 
   outputs = { self, nixpkgs, flake-utils, crane, fenix, ... }:

@@ -27,17 +27,17 @@ Mandrid is a high-performance, local-first AI memory layer designed to outperfor
 
 ## 🚀 Features in Progress
 
-- [ ] **Implicit Trace-Streaming:** Integrating `mem run` logic into shell hooks for zero-effort capture.
-
+- [x] **Implicit Trace-Streaming:** Integrating `mem run` logic into shell hooks for zero-effort capture.
+- [x] **Negative Memory:** Remembering "what failed" to avoid repeating mistakes (surfaced in `mem context`).
+- [x] **Knowledge Graph Layer:** Basic symbol-reference tracking for blast radius analysis (`mem impact`).
+- [x] **Polyglot Expansion:** Structural support for Go, C/C++, Java, C# in addition to Rust/Python/JS/TS.
 
 ## 📅 Potential / Future Features
 
-- [ ] **Cross-Encoder Reranking:** A local, CPU-friendly model (e.g., BGE-Reranker) for hyper-precision.
-- [ ] **LSP Hooking:** Integrating with Language Server Protocol to see code changes in real-time.
-- [ ] **Implicit Trace-Streaming:** Automatically capturing reasoning from terminal errors and edits.
-- [ ] **Negative Memory:** Remembering "what failed" to avoid repeating mistakes.
-- [ ] **Knowledge Graph Layer:** Storing relationships between functions/modules beyond simple chunks.
+- [ ] **Structured References:** Move from string-based reference matching to structured type-aware tracking.
 - [ ] **Team Sync (Optional):** Git-native memory sharing (JSONL traces in `.mandrid/`).
+- [ ] **Context Window Optimization:** Better summarization for extremely long reasoning traces.
+- [ ] **Dashboard Visualization:** Graph view of the symbol relationships.
 
 ## 🖥 Resource Strategy
 - **Target:** Systems with Integrated Graphics & High RAM.

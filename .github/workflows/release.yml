@@ -95,6 +95,23 @@ jobs:
           "PATH=$newPath" | Out-File -FilePath $env:GITHUB_ENV -Append
           "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=link.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      - name: Pin MSVC linker path (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: |
+          $vswhere = "$env:ProgramFiles(x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere not found" }
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $vsPath) { throw "Visual Studio installation not found" }
+          $msvcRoot = Join-Path $vsPath "VC\Tools\MSVC"
+          $ver = Get-ChildItem -Path $msvcRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $ver) { throw "MSVC toolset not found" }
+          $linkerDir = Join-Path $ver.FullName "bin\Hostx64\x64"
+          $linker = Join-Path $linkerDir "link.exe"
+          if (-not (Test-Path $linker)) { throw "MSVC link.exe not found" }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PATH=$linkerDir;$env:Path" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:

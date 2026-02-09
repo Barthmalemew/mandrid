@@ -72,6 +72,10 @@ export MEM_PACK_TYPE_CAPS="trace=2,thought=1,task=2,auto=2"
 
 # Only include active tasks
 mem pack "<prompt>" --task-status active
+
+# Record constraints and intent (used for warnings and prioritization)
+mem rule "Rule: Widgets stay behind windows" --match "widgets,top layer"
+mem intent "Intent: Keep UI layout modular and avoid cross-layer coupling"
 ```
 
 4. **Enable automated capture (Shell Hook):**

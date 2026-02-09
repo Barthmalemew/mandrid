@@ -50,6 +50,8 @@ use crate::task::*;
 const DEFAULT_DB_DIR: &str = ".mem_db";
 const AUTO_DIR_NAME: &str = ".mem_auto";
 const TRACE_OUTPUT_MAX_CHARS: usize = 8000;
+const PACK_RULE_LIMIT: usize = 12;
+const PACK_INTENT_LIMIT: usize = 10;
 
 #[derive(ValueEnum, Clone, Debug)]
 enum ContextScope {
@@ -151,6 +153,29 @@ enum Command {
     Save {
         text: String,
         #[arg(long, default_value = "manual")]
+        tag: String,
+        #[arg(long)]
+        session: Option<String>,
+    },
+
+    /// Record a constraint or rule to enforce later.
+    Rule {
+        text: String,
+        /// Optional tag (defaults to "rule")
+        #[arg(long, default_value = "rule")]
+        tag: String,
+        /// Match patterns for warning checks (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        r#match: Vec<String>,
+        #[arg(long)]
+        session: Option<String>,
+    },
+
+    /// Record design intent or user rationale.
+    Intent {
+        text: String,
+        /// Optional tag (defaults to "intent")
+        #[arg(long, default_value = "intent")]
         tag: String,
         #[arg(long)]
         session: Option<String>,
@@ -638,6 +663,9 @@ struct PackJsonPayload {
     input: String,
     active_task_title: Option<String>,
     last_failure: Option<String>,
+    warnings: Vec<String>,
+    rules: Vec<PackJsonItem>,
+    intents: Vec<PackJsonItem>,
     episodic: Vec<PackJsonItem>,
     code: Vec<PackJsonItem>,
     pack: String,
@@ -922,6 +950,98 @@ fn normalize_memory_types(types: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+fn memory_type_allowed(target: &str, include: &[String], exclude: &[String]) -> bool {
+    let target = target.to_lowercase();
+    if exclude.iter().any(|t| t == &target) {
+        return false;
+    }
+    if include.is_empty() {
+        return true;
+    }
+    include.iter().any(|t| t == &target)
+}
+
+fn build_rule_references(matchers: &[String]) -> String {
+    if matchers.is_empty() {
+        return "[]".to_string();
+    }
+    let normalized: Vec<String> = matchers
+        .iter()
+        .map(|m| m.trim())
+        .filter(|m| !m.is_empty())
+        .map(|m| format!("match:{}", m))
+        .collect();
+    serde_json::to_string(&normalized).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn parse_rule_matchers(raw: &str) -> Vec<String> {
+    let Ok(items) = serde_json::from_str::<Vec<String>>(raw) else {
+        return Vec::new();
+    };
+    items
+        .into_iter()
+        .filter_map(|item| item.strip_prefix("match:").map(|m| m.trim().to_string()))
+        .filter(|m| !m.is_empty())
+        .collect()
+}
+
+fn detect_rule_warnings(input: &str, rules: &[DecodedRow]) -> Vec<String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Vec::new();
+    }
+    let input_lower = input.to_lowercase();
+    let mut warnings = Vec::new();
+    for rule in rules {
+        let matchers = parse_rule_matchers(&rule.references);
+        if matchers.is_empty() {
+            continue;
+        }
+        let mut matched = false;
+        for matcher in matchers {
+            if input_lower.contains(&matcher.to_lowercase()) {
+                matched = true;
+                break;
+            }
+        }
+        if matched {
+            let first = rule.text.lines().next().unwrap_or("").trim();
+            if !first.is_empty() {
+                warnings.push(format!(
+                    "Possible rule conflict: {}",
+                    truncate_chars(first, 200)
+                ));
+            }
+        }
+    }
+    warnings
+}
+
+async fn fetch_recent_by_type(
+    table: &lancedb::Table,
+    memory_type: &str,
+    scope: &ContextScope,
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<DecodedRow>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut filter = format!("memory_type = '{}'", escape_lancedb_str(memory_type));
+    if matches!(scope, ContextScope::Session) {
+        filter.push_str(&format!(
+            " AND session_id = '{}'",
+            escape_lancedb_str(session_id)
+        ));
+    }
+    let stream = table.query().only_if(filter).limit(limit * 2).execute().await?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+    let mut rows = decode_rows(&batches, None)?;
+    rows.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+    rows.truncate(limit);
+    Ok(rows)
 }
 
 fn parse_type_caps(items: &[String]) -> HashMap<String, usize> {
@@ -1734,6 +1854,9 @@ fn build_pack_text(
     input: &str,
     active_task_title: Option<&str>,
     last_failure: Option<&str>,
+    warnings: &[String],
+    rules: &[DecodedRow],
+    intents: &[DecodedRow],
     episodic: &[DecodedRow],
     code: &[DecodedRow],
 ) -> String {
@@ -1765,6 +1888,53 @@ fn build_pack_text(
         out.push_str(s);
         true
     };
+
+    if !warnings.is_empty() {
+        if !try_push("\n[warnings]\n", &mut out) {
+            out.push_str("</mem_pack>\n");
+            return out;
+        }
+        for warning in warnings {
+            let item = format!("- {}\n", truncate_chars(warning, 240));
+            if !try_push(&item, &mut out) {
+                out.push_str("\n[...budget exceeded...]\n");
+                out.push_str("</mem_pack>\n");
+                return out;
+            }
+        }
+    }
+
+    if !rules.is_empty() {
+        if !try_push("\n[rules]\n", &mut out) {
+            out.push_str("</mem_pack>\n");
+            return out;
+        }
+        for r in rules {
+            let first = r.text.lines().next().unwrap_or("").trim();
+            let item = format!("- {}\n", truncate_chars(first, 220));
+            if !try_push(&item, &mut out) {
+                out.push_str("\n[...budget exceeded...]\n");
+                out.push_str("</mem_pack>\n");
+                return out;
+            }
+        }
+    }
+
+    if !intents.is_empty() {
+        if !try_push("\n[intent]\n", &mut out) {
+            out.push_str("</mem_pack>\n");
+            return out;
+        }
+        for r in intents {
+            let first = r.text.lines().next().unwrap_or("").trim();
+            let item = format!("- {}\n", truncate_chars(first, 220));
+            if !try_push(&item, &mut out) {
+                out.push_str("\n[...budget exceeded...]\n");
+                out.push_str("</mem_pack>\n");
+                return out;
+            }
+        }
+    }
 
     if !episodic.is_empty() {
         if !try_push("\n[episodic]\n", &mut out) {
@@ -1854,6 +2024,54 @@ async fn main() -> Result<()> {
             };
             add_rows(&table, vec![row]).await?;
             println!("Saved");
+        }
+        Command::Rule { text, tag, r#match, session } => {
+            let mut embedder = init_embedder(cache_dir.clone(), true)?;
+            let table = open_or_create_table(&db_path).await?;
+            let embedding = embed_prefixed(&mut embedder, "passage", &text)?;
+            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+            let row = MemoryRow {
+                vector: embedding,
+                text,
+                tag: get_origin_tag(&tag),
+                memory_type: "rule".to_string(),
+                file_path: "rule".to_string(),
+                line_start: 0,
+                session_id: session.unwrap_or_else(|| "default".to_string()),
+                name: String::new(),
+                references: build_rule_references(&r#match),
+                depends_on: "[]".to_string(),
+                status: "active".to_string(),
+                mtime_secs: 0,
+                size_bytes: 0,
+                created_at: now,
+            };
+            add_rows(&table, vec![row]).await?;
+            println!("Rule saved");
+        }
+        Command::Intent { text, tag, session } => {
+            let mut embedder = init_embedder(cache_dir.clone(), true)?;
+            let table = open_or_create_table(&db_path).await?;
+            let embedding = embed_prefixed(&mut embedder, "passage", &text)?;
+            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+            let row = MemoryRow {
+                vector: embedding,
+                text,
+                tag: get_origin_tag(&tag),
+                memory_type: "intent".to_string(),
+                file_path: "intent".to_string(),
+                line_start: 0,
+                session_id: session.unwrap_or_else(|| "default".to_string()),
+                name: String::new(),
+                references: "[]".to_string(),
+                depends_on: "[]".to_string(),
+                status: "active".to_string(),
+                mtime_secs: 0,
+                size_bytes: 0,
+                created_at: now,
+            };
+            add_rows(&table, vec![row]).await?;
+            println!("Intent saved");
         }
         Command::Log { text, tag, memory_type, status, file_path, name, session } => {
             if is_server_alive(3000).await {
@@ -2856,6 +3074,8 @@ Your current assigned role: **{}**
             let include_types = normalize_memory_types(&include_types);
             let exclude_types = normalize_memory_types(&exclude_types);
             let type_caps = parse_type_caps(&type_caps);
+            let allow_rules = memory_type_allowed("rule", &include_types, &exclude_types);
+            let allow_intent = memory_type_allowed("intent", &include_types, &exclude_types);
             let mut filter_parts = vec![
                 "memory_type != 'code'".to_string(),
                 "memory_type != 'system_config'".to_string(),
@@ -2941,6 +3161,49 @@ Your current assigned role: **{}**
                 .await?
             };
 
+            if !episodic_rows.is_empty() {
+                episodic_rows.retain(|row| {
+                    let t = row.memory_type.as_str();
+                    t != "rule" && t != "intent"
+                });
+            }
+
+            let mut rule_rows = if allow_rules {
+                fetch_recent_by_type(&table, "rule", &scope, &session_id, PACK_RULE_LIMIT).await?
+            } else {
+                Vec::new()
+            };
+            let mut intent_rows = if allow_intent {
+                fetch_recent_by_type(&table, "intent", &scope, &session_id, PACK_INTENT_LIMIT).await?
+            } else {
+                Vec::new()
+            };
+
+            if !rule_rows.is_empty() {
+                let mut seen = HashSet::new();
+                let mut deduped = Vec::with_capacity(rule_rows.len());
+                for row in rule_rows.into_iter() {
+                    let key = row.text.clone();
+                    if seen.insert(key) {
+                        deduped.push(row);
+                    }
+                }
+                rule_rows = deduped;
+            }
+            if !intent_rows.is_empty() {
+                let mut seen = HashSet::new();
+                let mut deduped = Vec::with_capacity(intent_rows.len());
+                for row in intent_rows.into_iter() {
+                    let key = row.text.clone();
+                    if seen.insert(key) {
+                        deduped.push(row);
+                    }
+                }
+                intent_rows = deduped;
+            }
+
+            let warnings = detect_rule_warnings(&input, &rule_rows);
+
             let mut code_rows: Vec<DecodedRow> = if include_code && k_code > 0 {
                 let code_filter = "memory_type = 'code'";
                 if let Some(ref mut rr) = reranker {
@@ -3018,6 +3281,9 @@ Your current assigned role: **{}**
                 &input,
                 active_task_title.as_deref(),
                 last_failure.as_deref(),
+                &warnings,
+                &rule_rows,
+                &intent_rows,
                 &episodic_rows,
                 &code_rows,
             );
@@ -3031,6 +3297,9 @@ Your current assigned role: **{}**
                     input: input.clone(),
                     active_task_title: active_task_title.clone(),
                     last_failure: last_failure.clone(),
+                    warnings: warnings.clone(),
+                    rules: rule_rows.iter().map(|r| to_pack_item(r, 600, false)).collect(),
+                    intents: intent_rows.iter().map(|r| to_pack_item(r, 600, false)).collect(),
                     episodic: episodic_rows
                         .iter()
                         .map(|r| to_pack_item(r, 700, false))
@@ -4193,6 +4462,8 @@ You are equipped with Mandrid, a local persistent memory layer. Use these tools 
  - `mem think "<reasoning>"`: **PROACTIVE**. Store your plan before acting.
  - `mem run -- <command>`: **CRITICAL**. Run terminal commands through this to record success/failure and output.
  - `mem capture "<summary>"`: Permanent record of changes and reasoning.
+ - `mem rule "<constraint>" --match "<pattern>"`: Record constraints with optional match patterns.
+ - `mem intent "<rationale>"`: Record design intent or user rationale.
  - `mem auto <subcommand>`: Deterministic auto-memory from git/command events (LLM-free).
 
  ## Maintenance
@@ -4223,6 +4494,8 @@ You are equipped with Mandrid, a local persistent memory layer. Use these tools 
                           { "name": "mem think", "description": "Persist internal reasoning." },
                           { "name": "mem run", "description": "Execute terminal commands with telemetry capture." },
                           { "name": "mem auto", "description": "Deterministic auto-memory from git/command events." },
+                          { "name": "mem rule", "description": "Record a constraint or rule with optional match patterns." },
+                          { "name": "mem intent", "description": "Record design intent or user rationale." },
                           { "name": "mem rebuild", "description": "Rebuild the local DB after a Mandrid update." },
                           { "name": "mem doctor", "description": "Diagnose DB health/version and show backups." },
                           { "name": "mem prune", "description": "Delete old memories by type and age." }
